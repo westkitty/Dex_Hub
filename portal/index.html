@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DexHub Tablet Portal</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header class="header">
+        <h1>DexHub Tablet Portal</h1>
+        <div id="status" class="status">Initializing…</div>
+      </header>
+
+      <section id="pairing" class="card hidden">
+        <h2>Pair Device</h2>
+        <p>Enter the 6-digit code shown on the Big Mac console.</p>
+        <div class="row">
+          <input id="pair-code" maxlength="6" placeholder="123456" inputmode="numeric" />
+          <button id="pair-button">Pair</button>
+        </div>
+        <div id="pair-result" class="muted"></div>
+      </section>
+
+      <section id="controls" class="card hidden">
+        <h2>Quick Actions</h2>
+        <div class="row">
+          <input id="tts-text" placeholder="Say something…" />
+          <button id="tts-button">Send /tts</button>
+        </div>
+        <div class="row">
+          <button id="queue-flush">Flush Offline Queue</button>
+          <span id="queue-count" class="muted">Queued: 0</span>
+        </div>
+        <audio id="tts-audio" controls class="audio"></audio>
+        <pre id="api-output" class="output"></pre>
+      </section>
+
+      <section class="card">
+        <h2>Notes</h2>
+        <ul>
+          <li>All signed requests include headers: X-DEX-DeviceId, X-DEX-Timestamp, X-DEX-Nonce, X-DEX-BodySha256, X-DEX-Signature.</li>
+          <li>Offline queue mode: <strong>metadata_only</strong> (no body stored).</li>
+        </ul>
+      </section>
+    </main>
+
+    <script type="module" src="app.js"></script>
+  </body>
+</html>

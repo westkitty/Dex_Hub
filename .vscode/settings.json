@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "pip": true,
+        "mkdir": true,
+        "printf": true,
+        "uvicorn": true
+    }
+}
