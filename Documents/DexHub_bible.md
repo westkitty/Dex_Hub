@@ -90,7 +90,7 @@ Use this SVG for the system tray icon to ensure immediate visual identity.
 **Constraint:** `.env` files are for local development **only**. In production, secrets **must** be stored in the macOS Keychain or encrypted config stores.
 
 ```
-/Users/andrew/Projects/DexHub
+/Users/username/Projects/DexHub
 ├── README.md
 ├── dexhub_codex.md
 ├── config/                   # [Shared] Configuration
@@ -119,7 +119,7 @@ Use this SVG for the system tray icon to ensure immediate visual identity.
 
 **Role:** Offload heavy processing from MacBook Air.
 
-**Path:** `/Users/andrew/Projects/DexHub/server/`
+**Path:** `/Users/username/Projects/DexHub/server/`
 
 ### 4.1 Dependencies (`requirements.txt`)
 
@@ -433,7 +433,7 @@ if __name__ == "__main__":
 
 **Role:** Primary interface & persistence.
 
-**Path:** `/Users/andrew/Projects/DexHub/client/`
+**Path:** `/Users/username/Projects/DexHub/client/`
 
 ### 5.1 Rust Dependencies (`src-tauri/Cargo.toml`)
 

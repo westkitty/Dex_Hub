@@ -1,12 +1,12 @@
 # DexHub AI Handoff Prompt
 
-You are taking over the DexHub workspace at /Users/andrew/Projects/DexHub. Below is a concise record of what was implemented and updated.
+You are taking over the DexHub workspace at /Users/username/Projects/DexHub. Below is a concise record of what was implemented and updated.
 
 ## Summary of Completed Work
 
 ### 1) Repo path normalization in spec
 - Updated the DexHub spec file at [Documents/DexHub_bible.md](Documents/DexHub_bible.md) to use the canonical repo root path.
-- Replaced all occurrences of `/Users/andrew/Projects/Anti_grav/DexHub` with `/Users/andrew/Projects/DexHub`.
+- Replaced all occurrences of `/Users/username/Projects/Anti_grav/DexHub` with `/Users/username/Projects/DexHub`.
 - Verified no remaining references to the old path or `Anti_grav` fragments.
 
 ### 2) Prompt 8.5 — Hardened Tauri Shell (client)
@@ -69,7 +69,7 @@ Created a minimal hardened tablet portal under [portal/](portal/):
 - [portal/app.js](portal/app.js)
 
 ## Notes / Caveats
-- Workspace root: /Users/andrew/Projects/DexHub (canonical in spec).
+- Workspace root: /Users/username/Projects/DexHub (canonical in spec).
 - There is no React UI scaffold yet; only the portal and Tauri backend were created.
 - No tests were added.
 - Build/run commands are referenced in the spec: `cd server && uvicorn dexhub_server:app --reload` and `cd client && tauri dev`.
