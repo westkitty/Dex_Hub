@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import {
   Star, Play, Square, ExternalLink, Copy,
   Terminal, QrCode, Check, AlertCircle, RotateCcw,
@@ -10,7 +10,6 @@ import {
   openTerminalHere, updateServerPort, getServerUrl,
   getServerLatency, getServerUptime, getServerLogs,
   getProjectReadme, getEnvOverrides, setEnvOverrides,
-  restartServer,
 } from '../lib/servers';
 
 export type HealthStatus = 'healthy' | 'starting' | 'down';
@@ -214,7 +213,7 @@ export function ServerCard({
   const [showReadme,   setShowReadme]  = useState(false);
   const [showEnvEditor,setShowEnvEditor] = useState(false);
   const [contextMenu,  setContextMenu] = useState<{x:number;y:number}|null>(null);
-  const [dragging,     setDragging]    = useState(false);
+  const [dragging,     _setDragging]   = useState(false);
 
   const portRef  = useRef<HTMLInputElement>(null);
   const logsRef  = useRef<HTMLDivElement>(null);

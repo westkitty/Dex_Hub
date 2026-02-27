@@ -838,23 +838,26 @@ fn set_autostart_enabled(enabled: bool) -> Result<(), String> {
 
 // ─── Tray Icon ────────────────────────────────────────────────────────────────
 
-/// Generates a 22×22 RGBA lightning-bolt icon (white on transparent).
+/// Generates a 22×22 RGBA lightning-bolt icon (black on transparent).
 /// The bolt is drawn as two parallelogram bands that together form a ⚡ shape.
-/// macOS treats white-on-transparent images as "template images", automatically
-/// inverting them for dark/light menu-bar mode — so white renders correctly in both.
+///
+/// The icon is registered as a macOS *template image* via `.icon_as_template(true)`.
+/// Template images must be black silhouettes; macOS automatically renders them
+/// white on a dark menu bar and black on a light menu bar, matching system appearance.
 fn lightning_bolt_icon_rgba() -> Vec<u8> {
     const W: u32 = 22;
     const H: u32 = 22;
     let mut rgba = vec![0u8; (W * H * 4) as usize];
 
-    // Helper: paint a pixel white & fully opaque
+    // Helper: paint a pixel black & fully opaque.
+    // (Template images are black silhouettes — macOS inverts them automatically.)
     let mut set = |x: u32, y: u32| {
         if x < W && y < H {
             let i = ((y * W + x) * 4) as usize;
-            rgba[i]     = 255; // R
-            rgba[i + 1] = 255; // G
-            rgba[i + 2] = 255; // B
-            rgba[i + 3] = 255; // A
+            rgba[i]     = 0;   // R — black
+            rgba[i + 1] = 0;   // G
+            rgba[i + 2] = 0;   // B
+            rgba[i + 3] = 255; // A — fully opaque
         }
     };
 
@@ -911,6 +914,7 @@ fn main() {
             let tray = TrayIconBuilder::new()
                 .menu(&initial_menu)
                 .icon(tauri::image::Image::new_owned(lightning_bolt_icon_rgba(), 22, 22))
+                .icon_as_template(true)   // macOS: renders white on dark bar, black on light bar
                 .on_menu_event(|app: &tauri::AppHandle, event: tauri::menu::MenuEvent| {
                     handle_menu_event(app, event.id().as_ref());
                 })

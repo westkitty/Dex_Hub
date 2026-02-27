@@ -211,8 +211,6 @@ describe('ServerCard', () => {
 
     it('calls onToggleFavorite when star is clicked', () => {
       render(<ServerCard {...defaultProps} />);
-      const starBtn = screen.getByRole('button', { name: /star/i })
-        ?? document.querySelector('button:has(.w-3\\.5)');
       // Find the favorite button (Star icon container)
       const buttons = screen.getAllByRole('button');
       // Star button is the one near the status dot
