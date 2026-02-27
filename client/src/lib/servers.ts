@@ -49,3 +49,6 @@ export const saveFavoritesToRust = (names: string[]): Promise<void> =>
 
 export const refreshProjects = (): Promise<ProjectConfig[]> =>
   invoke('refresh_projects_cmd');
+
+export const setPin = (pinned: boolean): Promise<void> =>
+  invoke('set_pin', { pinned });

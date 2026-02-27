@@ -28,41 +28,43 @@ function App() {
   const doneCards  = cards.filter((c) => c.status === "done");
 
   return (
-    <div className="flex bg-background text-white h-screen font-sans selection:bg-accent-primary/30 overflow-hidden">
+    <div className="flex text-white h-screen font-sans selection:bg-accent-primary/30 overflow-hidden">
       <Sidebar activeView={view} onViewChange={setView} />
 
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
         {view === 'servers' ? (
-          <ServersView />
+          <div key="servers" className="flex-1 flex flex-col overflow-hidden animate-fade-in">
+            <ServersView />
+          </div>
         ) : (
-          <>
+          <div key="kanban" className="flex-1 flex flex-col overflow-hidden animate-fade-in">
             <Header />
-            <main className="flex-1 p-6 overflow-auto">
+            <main className="flex-1 p-5 overflow-auto custom-scrollbar">
               <div className="max-w-6xl mx-auto">
-                <h2 className="text-2xl font-bold mb-6">Omni-View</h2>
+                <h2 className="text-xl font-bold mb-5 text-white/80">Omni-View</h2>
 
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                   {/* Todo */}
-                  <div className="space-y-4">
+                  <div className="space-y-3">
                     <div className="flex items-center justify-between mb-2">
-                      <h3 className="font-medium text-gray-400">To Do</h3>
-                      <span className="text-xs bg-white/5 px-2 py-0.5 rounded text-gray-500">
+                      <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider">To Do</h3>
+                      <span className="text-xs bg-white/5 px-2 py-0.5 rounded-full text-gray-600">
                         {todoCards.length}
                       </span>
                     </div>
                     {todoCards.map((card) => <Card key={card.id} card={card} />)}
                     {todoCards.length === 0 && (
-                      <div className="text-sm text-gray-600 italic border border-dashed border-white/5 rounded p-4 text-center">
+                      <div className="text-sm text-gray-700 border border-dashed border-white/5 rounded-lg p-4 text-center">
                         No tasks pending
                       </div>
                     )}
                   </div>
 
                   {/* Doing */}
-                  <div className="space-y-4">
+                  <div className="space-y-3">
                     <div className="flex items-center justify-between mb-2">
-                      <h3 className="font-medium text-gray-400">Doing</h3>
-                      <span className="text-xs bg-white/5 px-2 py-0.5 rounded text-gray-500">
+                      <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Doing</h3>
+                      <span className="text-xs bg-white/5 px-2 py-0.5 rounded-full text-gray-600">
                         {doingCards.length}
                       </span>
                     </div>
@@ -70,10 +72,10 @@ function App() {
                   </div>
 
                   {/* Done */}
-                  <div className="space-y-4">
+                  <div className="space-y-3">
                     <div className="flex items-center justify-between mb-2">
-                      <h3 className="font-medium text-gray-400">Done</h3>
-                      <span className="text-xs bg-white/5 px-2 py-0.5 rounded text-gray-500">
+                      <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider">Done</h3>
+                      <span className="text-xs bg-white/5 px-2 py-0.5 rounded-full text-gray-600">
                         {doneCards.length}
                       </span>
                     </div>
@@ -82,10 +84,9 @@ function App() {
                 </div>
               </div>
             </main>
-          </>
+          </div>
         )}
       </div>
-
     </div>
   );
 }

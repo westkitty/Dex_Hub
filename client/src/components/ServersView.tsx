@@ -267,7 +267,7 @@ export function ServersView() {
                     Favorites
                   </span>
                 </div>
-                <div className={`grid ${gridClass} gap-2`}>
+                <div className={`grid ${gridClass} gap-2 animate-cards`}>
                   {favProjects.map(renderCard)}
                 </div>
               </section>
@@ -282,7 +282,7 @@ export function ServersView() {
                   </span>
                   <span className="text-[10px] text-gray-700">{wsProjects.length}</span>
                 </div>
-                <div className={`grid ${gridClass} gap-2`}>
+                <div className={`grid ${gridClass} gap-2 animate-cards`}>
                   {wsProjects.map(renderCard)}
                 </div>
               </section>

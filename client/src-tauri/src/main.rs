@@ -643,6 +643,14 @@ fn set_favorites(app: tauri::AppHandle, names: Vec<String>) -> Result<(), String
 }
 
 #[tauri::command]
+fn set_pin(app: tauri::AppHandle, pinned: bool) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("main") {
+        win.set_always_on_top(pinned).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn refresh_projects_cmd(app: tauri::AppHandle) -> Vec<ProjectConfig> {
     let app_data_dir = app
         .path()
@@ -726,6 +734,7 @@ fn main() {
             get_tailscale_address,
             get_favorites,
             set_favorites,
+            set_pin,
             refresh_projects_cmd,
         ])
         .build(tauri::generate_context!())

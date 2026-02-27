@@ -15,11 +15,13 @@
       {
         "label": "main",
         "title": "DexHub",
-        "width": 640,
-        "height": 620,
+        "width": 660,
+        "height": 640,
         "resizable": false,
         "visible": false,
-        "decorations": true
+        "decorations": false,
+        "transparent": true,
+        "shadow": true
       }
     ],
     "security": {
