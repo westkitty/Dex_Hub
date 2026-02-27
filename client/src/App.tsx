@@ -8,8 +8,9 @@ import { getCards, type Card as CardType } from "./lib/api";
 export type View = 'servers' | 'kanban';
 
 function App() {
-  const [view, setView]   = useState<View>('servers');
-  const [cards, setCards] = useState<CardType[]>([]);
+  const [view,         setView]         = useState<View>('servers');
+  const [cards,        setCards]        = useState<CardType[]>([]);
+  const [runningCount, setRunningCount] = useState(0);
 
   // Only poll cards when the kanban view is active
   useEffect(() => {
@@ -29,12 +30,12 @@ function App() {
 
   return (
     <div className="flex text-white h-screen font-sans selection:bg-accent-primary/30 overflow-hidden">
-      <Sidebar activeView={view} onViewChange={setView} />
+      <Sidebar activeView={view} onViewChange={setView} runningCount={runningCount} />
 
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
         {view === 'servers' ? (
           <div key="servers" className="flex-1 flex flex-col overflow-hidden animate-fade-in">
-            <ServersView />
+            <ServersView onRunningCountChange={setRunningCount} />
           </div>
         ) : (
           <div key="kanban" className="flex-1 flex flex-col overflow-hidden animate-fade-in">

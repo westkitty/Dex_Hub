@@ -1,12 +1,14 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent, act, waitFor } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, screen, fireEvent, act } from '@testing-library/react';
 import { invoke } from '@tauri-apps/api/core';
 import App from './App';
 
 const mockInvoke = vi.mocked(invoke);
 
 beforeEach(() => {
+  vi.useFakeTimers();
   vi.clearAllMocks();
+  sessionStorage.clear();
   // Default mocks for ServersView (default view)
   mockInvoke.mockImplementation((cmd: string) => {
     switch (cmd) {
@@ -16,9 +18,20 @@ beforeEach(() => {
       case 'get_tailscale_address': return Promise.resolve('localhost');
       case 'check_server_health':   return Promise.resolve(false);
       case 'get_cards':             return Promise.resolve('[]');
+      case 'scan_external_servers': return Promise.resolve([]);
+      case 'get_autostart_enabled': return Promise.resolve(false);
+      case 'get_server_logs':       return Promise.resolve([]);
+      case 'get_server_uptime':     return Promise.resolve(null);
+      case 'get_server_latency':    return Promise.resolve(null);
+      case 'get_env_overrides':     return Promise.resolve({});
+      case 'get_project_readme':    return Promise.resolve(null);
       default:                      return Promise.resolve(undefined);
     }
   });
+});
+
+afterEach(() => {
+  vi.useRealTimers();
 });
 
 describe('App', () => {
@@ -32,9 +45,7 @@ describe('App', () => {
   it('defaults to the Dev Servers view', async () => {
     render(<App />);
     await act(async () => { await Promise.resolve(); });
-    await waitFor(() => {
-      expect(screen.getByPlaceholderText('Search servers…')).toBeInTheDocument();
-    });
+    expect(screen.getByPlaceholderText('Search servers…')).toBeInTheDocument();
   });
 
   it('switches to kanban view when Omni-View is clicked', async () => {
@@ -43,6 +54,7 @@ describe('App', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /Omni-View/ }));
     await act(async () => { await Promise.resolve(); });
+
     // Kanban h2 heading confirms view switched
     expect(screen.getByRole('heading', { name: 'Omni-View' })).toBeInTheDocument();
     expect(screen.queryByPlaceholderText('Search servers…')).not.toBeInTheDocument();
@@ -65,8 +77,6 @@ describe('App', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /Dev Servers/ }));
     await act(async () => { await Promise.resolve(); });
-    await waitFor(() => {
-      expect(screen.getByPlaceholderText('Search servers…')).toBeInTheDocument();
-    });
+    expect(screen.getByPlaceholderText('Search servers…')).toBeInTheDocument();
   });
 });

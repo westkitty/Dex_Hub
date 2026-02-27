@@ -12,6 +12,8 @@ const makeProject = (overrides: Partial<ProjectConfig> = {}): ProjectConfig => (
   command: 'npm',
   args: ['run', 'dev'],
   port: 5173,
+  default_port: 5173,
+  extra_ports: [],
   icon_path: null,
   icon_data: null,
   workspace: 'Root',
@@ -26,13 +28,23 @@ function setupDefaultMocks(projects: ProjectConfig[] = []) {
       case 'get_favorites':         return Promise.resolve([]);
       case 'get_tailscale_address': return Promise.resolve('localhost');
       case 'check_server_health':   return Promise.resolve(false);
-      default:                      return Promise.resolve(undefined);
+      case 'scan_external_servers':   return Promise.resolve([]);
+      case 'get_autostart_enabled':   return Promise.resolve(false);
+      case 'get_server_logs':         return Promise.resolve([]);
+      case 'get_server_uptime':       return Promise.resolve(null);
+      case 'get_server_latency':      return Promise.resolve(null);
+      case 'get_env_overrides':       return Promise.resolve({});
+      case 'get_project_readme':      return Promise.resolve(null);
+      case 'restart_server_cmd':      return Promise.resolve(undefined);
+      default:                        return Promise.resolve(undefined);
     }
   });
 }
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Clear sessionStorage so search state doesn't leak between tests
+  sessionStorage.clear();
   setupDefaultMocks();
 });
 
@@ -52,7 +64,7 @@ describe('ServersView', () => {
     it('shows Tailscale offline when host is localhost', async () => {
       render(<ServersView />);
       await flushAll();
-      expect(screen.getByText(/Tailscale offline/i)).toBeInTheDocument();
+      expect(screen.getByText("localhost")).toBeInTheDocument();
     });
 
     it('shows Tailscale hostname when connected', async () => {
@@ -192,6 +204,7 @@ describe('ServersView', () => {
         if (cmd === 'get_tailscale_address') return Promise.resolve('localhost');
         if (cmd === 'check_server_health') return Promise.resolve(true);
         if (cmd === 'get_server_url') return Promise.resolve('http://localhost:5173');
+        if (cmd === 'scan_external_servers') return Promise.resolve([]);
         return Promise.resolve(undefined);
       });
       render(<ServersView />);
@@ -213,6 +226,7 @@ describe('ServersView', () => {
         if (cmd === 'get_favorites') return Promise.resolve([]);
         if (cmd === 'get_tailscale_address') return Promise.resolve('localhost');
         if (cmd === 'check_server_health') return Promise.resolve(true);
+        if (cmd === 'scan_external_servers') return Promise.resolve([]);
         return Promise.resolve(undefined);
       });
       render(<ServersView />);

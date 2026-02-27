@@ -1,6 +1,14 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { invoke } from '@tauri-apps/api/core';
 import { render, screen, fireEvent } from '@testing-library/react';
 import { Sidebar } from './Sidebar';
+
+const mockInvoke = vi.mocked(invoke);
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  mockInvoke.mockResolvedValue(false); // get_autostart_enabled returns false
+});
 
 describe('Sidebar', () => {
   const onViewChange = vi.fn();

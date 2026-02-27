@@ -1,9 +1,10 @@
 use base64::{engine::general_purpose, Engine as _};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{BufRead, BufReader};
 use std::net::TcpStream;
 use std::path::Path;
 use std::process::Child;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{
     menu::{IconMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu},
@@ -15,6 +16,10 @@ use walkdir::WalkDir;
 
 const PROJECTS_DIR: &str = "/Users/andrew/Projects";
 
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type LogBuffer = Arc<Mutex<VecDeque<String>>>;
+
 // ─── Project / Server State ───────────────────────────────────────────────────
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -24,15 +29,21 @@ struct ProjectConfig {
     command: String,
     args: Vec<String>,
     port: u16,
+    default_port: u16,       // original scanned port before any user override
+    extra_ports: Vec<u16>,   // additional ports from dexhub.ports in package.json
     icon_path: Option<String>,
     icon_data: Option<String>,
     workspace: String,
 }
 
 struct ServerState {
-    processes: Mutex<HashMap<String, Child>>,
-    projects: Mutex<Vec<ProjectConfig>>,
+    processes:     Mutex<HashMap<String, Child>>,
+    start_times:   Mutex<HashMap<String, std::time::Instant>>,
+    log_buffers:   Mutex<HashMap<String, LogBuffer>>,
+    latency_cache: Mutex<HashMap<String, u64>>,
+    projects:      Mutex<Vec<ProjectConfig>>,
     tailscale_host: String,
+    env_overrides: Mutex<HashMap<String, HashMap<String, String>>>,
 }
 
 struct TrayHandle(Mutex<Option<tauri::tray::TrayIcon<tauri::Wry>>>);
@@ -76,9 +87,7 @@ fn extract_port_after(text: &str, key: &str) -> Option<u16> {
     let end = after
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(after.len());
-    if end == 0 {
-        return None;
-    }
+    if end == 0 { return None; }
     after[..end].parse().ok()
 }
 
@@ -211,6 +220,45 @@ fn save_favorites_to_disk(app_data_dir: &Path, names: &[String]) {
     }
 }
 
+// ─── Env Override Helpers ─────────────────────────────────────────────────────
+
+fn env_overrides_path(app_data_dir: &Path) -> std::path::PathBuf {
+    app_data_dir.join("env_overrides.json")
+}
+
+fn load_env_overrides(app_data_dir: &Path) -> HashMap<String, HashMap<String, String>> {
+    let path = env_overrides_path(app_data_dir);
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        if let Ok(map) = serde_json::from_str(&content) {
+            return map;
+        }
+    }
+    HashMap::new()
+}
+
+fn save_env_overrides_to_disk(
+    app_data_dir: &Path,
+    overrides: &HashMap<String, HashMap<String, String>>,
+) {
+    let _ = std::fs::create_dir_all(app_data_dir);
+    if let Ok(json) = serde_json::to_string_pretty(overrides) {
+        let _ = std::fs::write(env_overrides_path(app_data_dir), json);
+    }
+}
+
+// ─── Crash Notification ───────────────────────────────────────────────────────
+
+fn notify_crash(name: &str) {
+    let script = format!(
+        "display notification \"Server '{}' stopped unexpectedly.\" \
+         with title \"DexHub\" sound name \"Basso\"",
+        name
+    );
+    let _ = std::process::Command::new("osascript")
+        .args(["-e", &script])
+        .spawn();
+}
+
 // ─── Project Scanner ──────────────────────────────────────────────────────────
 
 fn scan_projects(base_dir: &Path, port_overrides: &HashMap<String, u16>) -> Vec<ProjectConfig> {
@@ -234,34 +282,16 @@ fn scan_projects(base_dir: &Path, port_overrides: &HashMap<String, u16>) -> Vec<
         });
 
     for entry in walker.filter_map(|e| e.ok()) {
-        if entry.file_name() != "package.json" {
-            continue;
-        }
+        if entry.file_name() != "package.json" { continue; }
 
         let pkg_path = entry.path();
-        let project_dir = match pkg_path.parent() {
-            Some(d) => d,
-            None => continue,
-        };
+        let project_dir = match pkg_path.parent() { Some(d) => d, None => continue };
 
-        // Skip Tauri apps — launching them as a dev server would conflict with the host app
-        if project_dir
-            .join("src-tauri")
-            .join("tauri.conf.json")
-            .exists()
-        {
-            continue;
-        }
+        // Skip Tauri apps — launching them would conflict with the host
+        if project_dir.join("src-tauri").join("tauri.conf.json").exists() { continue; }
 
-        let content = match std::fs::read_to_string(pkg_path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let val: serde_json::Value = match serde_json::from_str(&content) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
+        let content = match std::fs::read_to_string(pkg_path) { Ok(c) => c, Err(_) => continue };
+        let val: serde_json::Value = match serde_json::from_str(&content) { Ok(v) => v, Err(_) => continue };
 
         let dev_script = match val["scripts"]["dev"].as_str() {
             Some(s) if !s.trim().is_empty() => s.to_string(),
@@ -271,16 +301,10 @@ fn scan_projects(base_dir: &Path, port_overrides: &HashMap<String, u16>) -> Vec<
         let name = val["name"]
             .as_str()
             .unwrap_or_else(|| {
-                project_dir
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
+                project_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown")
             })
             .to_string();
-
-        if name.trim().is_empty() {
-            continue;
-        }
+        if name.trim().is_empty() { continue; }
 
         let (command, args) = if dev_script.trim_start().starts_with("pnpm") {
             let rest = dev_script.trim_start_matches("pnpm").trim().to_string();
@@ -294,24 +318,30 @@ fn scan_projects(base_dir: &Path, port_overrides: &HashMap<String, u16>) -> Vec<
             ("npm".to_string(), vec!["run".to_string(), "dev".to_string()])
         };
 
-        let mut port = extract_port(project_dir);
-        if let Some(&override_port) = port_overrides.get(&name) {
-            port = override_port;
-        }
+        // default_port = what the project declares; port = after override
+        let default_port = extract_port(project_dir);
+        let mut port = default_port;
+        if let Some(&override_port) = port_overrides.get(&name) { port = override_port; }
+
+        // Extra ports declared via  "dexhub": { "ports": [3000, 5173] }  in package.json
+        let extra_ports: Vec<u16> = val["dexhub"]["ports"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_u64().map(|p| p as u16))
+                    .filter(|&p| p != port)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let icon_path = find_icon(project_dir);
         let icon_data = icon_path.as_ref().and_then(|p| icon_to_base64(p));
         let workspace = extract_workspace(&project_dir.to_string_lossy());
 
         projects.push(ProjectConfig {
-            name,
-            cwd: project_dir.to_string_lossy().into_owned(),
-            command,
-            args,
-            port,
-            icon_path,
-            icon_data,
-            workspace,
+            name, cwd: project_dir.to_string_lossy().into_owned(),
+            command, args, port, default_port, extra_ports,
+            icon_path, icon_data, workspace,
         });
     }
 
@@ -330,109 +360,52 @@ fn build_tray_menu<M: tauri::Manager<tauri::Wry>>(
     let menu = Menu::new(manager).expect("menu");
     menu.append(&PredefinedMenuItem::separator(manager).expect("sep")).ok();
     menu.append(
-        &MenuItem::with_id(manager, "_header_", "─── Servers ───", false, None::<&str>)
-            .expect("header"),
-    )
-    .ok();
+        &MenuItem::with_id(manager, "_header_", "─── Servers ───", false, None::<&str>).expect("header"),
+    ).ok();
 
     for project in projects {
         let is_running = running_names.iter().any(|n| n == &project.name);
         if is_running {
-            let url = format!("http://{}:{}", tailscale_host, project.port);
+            let url   = format!("http://{}:{}", tailscale_host, project.port);
             let label = format!("● {}", project.name);
-            let sub = Submenu::new(manager, &label, true).expect("submenu");
-            sub.append(
-                &MenuItem::with_id(
-                    manager,
-                    format!("open__{}", project.name),
-                    "Open in Browser",
-                    true,
-                    None::<&str>,
-                )
-                .expect("open"),
-            )
-            .ok();
-            sub.append(
-                &MenuItem::with_id(
-                    manager,
-                    format!("url__{}", project.name),
-                    &url,
-                    true,
-                    None::<&str>,
-                )
-                .expect("url"),
-            )
-            .ok();
-            sub.append(
-                &MenuItem::with_id(
-                    manager,
-                    format!("stop__{}", project.name),
-                    "Stop",
-                    true,
-                    None::<&str>,
-                )
-                .expect("stop"),
-            )
-            .ok();
+            let sub   = Submenu::new(manager, &label, true).expect("submenu");
+            sub.append(&MenuItem::with_id(manager, format!("open__{}", project.name), "Open in Browser", true, None::<&str>).expect("open")).ok();
+            sub.append(&MenuItem::with_id(manager, format!("url__{}", project.name), &url, true, None::<&str>).expect("url")).ok();
+            sub.append(&MenuItem::with_id(manager, format!("stop__{}", project.name), "Stop", true, None::<&str>).expect("stop")).ok();
             menu.append(&sub).ok();
         } else {
             let start_id = format!("start__{}", project.name);
             let mut added = false;
             if let Some(icon_path) = &project.icon_path {
                 if let Some(icon) = load_icon_image(icon_path) {
-                    if let Ok(item) = IconMenuItem::with_id(
-                        manager,
-                        &start_id,
-                        &project.name,
-                        true,
-                        Some(icon),
-                        None::<&str>,
-                    ) {
+                    if let Ok(item) = IconMenuItem::with_id(manager, &start_id, &project.name, true, Some(icon), None::<&str>) {
                         menu.append(&item).ok();
                         added = true;
                     }
                 }
             }
             if !added {
-                menu.append(
-                    &MenuItem::with_id(manager, &start_id, &project.name, true, None::<&str>)
-                        .expect("start"),
-                )
-                .ok();
+                menu.append(&MenuItem::with_id(manager, &start_id, &project.name, true, None::<&str>).expect("start")).ok();
             }
         }
     }
 
     menu.append(&PredefinedMenuItem::separator(manager).expect("sep")).ok();
-    menu.append(
-        &MenuItem::with_id(manager, "refresh", "Refresh", true, None::<&str>).expect("refresh"),
-    )
-    .ok();
+    menu.append(&MenuItem::with_id(manager, "refresh", "Refresh", true, None::<&str>).expect("refresh")).ok();
     menu.append(&PredefinedMenuItem::separator(manager).expect("sep")).ok();
-    menu.append(
-        &MenuItem::with_id(manager, "quit", "Quit DexHub", true, None::<&str>).expect("quit"),
-    )
-    .ok();
+    menu.append(&MenuItem::with_id(manager, "quit", "Quit DexHub", true, None::<&str>).expect("quit")).ok();
     menu
 }
 
 fn rebuild_tray(app: &tauri::AppHandle) {
     let server_state = app.state::<ServerState>();
-    let tray_handle = app.state::<TrayHandle>();
-    let running: Vec<String> = server_state
-        .processes
-        .lock()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect();
+    let tray_handle  = app.state::<TrayHandle>();
+    let running: Vec<String> = server_state.processes.lock().unwrap().keys().cloned().collect();
     let projects: Vec<ProjectConfig> = server_state.projects.lock().unwrap().clone();
     let ts_host = server_state.tailscale_host.clone();
     let new_menu = build_tray_menu(app, &projects, &running, &ts_host);
     let guard = tray_handle.0.lock().unwrap();
-    if let Some(tray) = guard.as_ref() {
-        let _ = tray.set_menu(Some(new_menu));
-    }
+    if let Some(tray) = guard.as_ref() { let _ = tray.set_menu(Some(new_menu)); }
 }
 
 // ─── Menu Event Handler ───────────────────────────────────────────────────────
@@ -441,20 +414,14 @@ fn handle_menu_event(app: &tauri::AppHandle, id: &str) {
     if id == "quit" {
         let state = app.state::<ServerState>();
         let mut procs = state.processes.lock().unwrap();
-        for (_, child) in procs.iter_mut() {
-            let _ = child.kill();
-        }
+        for (_, child) in procs.iter_mut() { let _ = child.kill(); }
         drop(procs);
         app.exit(0);
     } else if id == "refresh" {
-        let app_data_dir = app
-            .path()
-            .app_data_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+        let app_data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
         let overrides = load_port_overrides(&app_data_dir);
         let state = app.state::<ServerState>();
-        *state.projects.lock().unwrap() =
-            scan_projects(Path::new(PROJECTS_DIR), &overrides);
+        *state.projects.lock().unwrap() = scan_projects(Path::new(PROJECTS_DIR), &overrides);
         rebuild_tray(app);
     } else if let Some(name) = id.strip_prefix("start__") {
         start_server(app, name.to_string());
@@ -467,21 +434,72 @@ fn handle_menu_event(app: &tauri::AppHandle, id: &str) {
     }
 }
 
+// ─── Server Lifecycle ────────────────────────────────────────────────────────
+
 fn start_server(app: &tauri::AppHandle, name: String) {
     let state = app.state::<ServerState>();
-    let projects = state.projects.lock().unwrap().clone();
-    let project = match projects.iter().find(|p| p.name == name) {
-        Some(p) => p.clone(),
-        None => return,
+
+    // Gather env overrides before locking projects
+    let env_vars: HashMap<String, String> = state
+        .env_overrides
+        .lock()
+        .unwrap()
+        .get(&name)
+        .cloned()
+        .unwrap_or_default();
+
+    let project = {
+        let projects = state.projects.lock().unwrap();
+        match projects.iter().find(|p| p.name == name) {
+            Some(p) => p.clone(),
+            None => return,
+        }
     };
+
     let cmd_str = format!("{} {}", project.command, project.args.join(" "));
-    match std::process::Command::new("/bin/zsh")
-        .args(["-lc", &cmd_str])
+    let mut cmd = std::process::Command::new("/bin/zsh");
+    cmd.args(["-lc", &cmd_str])
         .current_dir(&project.cwd)
-        .spawn()
-    {
-        Ok(child) => {
-            state.processes.lock().unwrap().insert(name, child);
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in &env_vars { cmd.env(k, v); }
+
+    match cmd.spawn() {
+        Ok(mut child) => {
+            // Create a per-server log buffer (ring buffer, max 500 lines)
+            let log_buf: LogBuffer = Arc::new(Mutex::new(VecDeque::with_capacity(500)));
+
+            // Stdout reader thread
+            if let Some(stdout) = child.stdout.take() {
+                let buf = Arc::clone(&log_buf);
+                std::thread::spawn(move || {
+                    for line in BufReader::new(stdout).lines() {
+                        if let Ok(l) = line {
+                            let mut b = buf.lock().unwrap();
+                            if b.len() >= 500 { b.pop_front(); }
+                            b.push_back(l);
+                        }
+                    }
+                });
+            }
+            // Stderr reader thread
+            if let Some(stderr) = child.stderr.take() {
+                let buf = Arc::clone(&log_buf);
+                std::thread::spawn(move || {
+                    for line in BufReader::new(stderr).lines() {
+                        if let Ok(l) = line {
+                            let mut b = buf.lock().unwrap();
+                            if b.len() >= 500 { b.pop_front(); }
+                            b.push_back(format!("[err] {}", l));
+                        }
+                    }
+                });
+            }
+
+            let now = std::time::Instant::now();
+            state.processes.lock().unwrap().insert(name.clone(), child);
+            state.start_times.lock().unwrap().insert(name.clone(), now);
+            state.log_buffers.lock().unwrap().insert(name, log_buf);
             rebuild_tray(app);
         }
         Err(e) => eprintln!("[DexHub] Failed to start '{}': {}", name, e),
@@ -493,6 +511,8 @@ fn stop_server(app: &tauri::AppHandle, name: String) {
     if let Some(mut child) = state.processes.lock().unwrap().remove(&name) {
         let _ = child.kill();
     }
+    state.start_times.lock().unwrap().remove(&name);
+    // Keep log buffer around after stop for post-mortem viewing
     rebuild_tray(app);
 }
 
@@ -526,17 +546,20 @@ fn list_projects(state: tauri::State<'_, ServerState>) -> Vec<ProjectConfig> {
 #[tauri::command]
 fn get_running_servers(app: tauri::AppHandle) -> Vec<String> {
     let state = app.state::<ServerState>();
-    let (names, had_dead) = {
+    let (names, crashed_names) = {
         let mut procs = state.processes.lock().unwrap();
-        let before = procs.len();
-        // Remove any processes that have already exited so crashed servers
-        // don't stay stuck in the "starting" state indefinitely.
+        let before: Vec<String> = procs.keys().cloned().collect();
         procs.retain(|_, child| child.try_wait().map(|s| s.is_none()).unwrap_or(true));
-        let had_dead = procs.len() < before;
+        let after: HashSet<&String> = procs.keys().collect();
+        let crashed: Vec<String> = before.into_iter().filter(|n| !after.contains(n)).collect();
         let names = procs.keys().cloned().collect::<Vec<String>>();
-        (names, had_dead)
+        (names, crashed)
     };
-    if had_dead {
+    if !crashed_names.is_empty() {
+        let mut start_times = state.start_times.lock().unwrap();
+        for n in &crashed_names { start_times.remove(n); }
+        drop(start_times);
+        for n in &crashed_names { notify_crash(n); }
         rebuild_tray(&app);
     }
     names
@@ -555,14 +578,22 @@ fn stop_server_cmd(app: tauri::AppHandle, name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn restart_server_cmd(app: tauri::AppHandle, name: String) -> Result<(), String> {
+    stop_server(&app, name.clone());
+    // Brief yield so the OS can reclaim the port before re-binding
+    std::thread::sleep(Duration::from_millis(300));
+    start_server(&app, name);
+    Ok(())
+}
+
+#[tauri::command]
 fn stop_all_servers_cmd(app: tauri::AppHandle) -> Result<(), String> {
     {
         let state = app.state::<ServerState>();
         let mut procs = state.processes.lock().unwrap();
-        for (_, child) in procs.iter_mut() {
-            let _ = child.kill();
-        }
+        for (_, child) in procs.iter_mut() { let _ = child.kill(); }
         procs.clear();
+        state.start_times.lock().unwrap().clear();
     }
     rebuild_tray(&app);
     Ok(())
@@ -576,9 +607,7 @@ fn update_server_port(app: tauri::AppHandle, name: String, port: u16) -> Result<
     save_port_overrides(&app_data_dir, &overrides);
     let state = app.state::<ServerState>();
     let mut projects = state.projects.lock().unwrap();
-    if let Some(p) = projects.iter_mut().find(|p| p.name == name) {
-        p.port = port;
-    }
+    if let Some(p) = projects.iter_mut().find(|p| p.name == name) { p.port = port; }
     Ok(())
 }
 
@@ -612,14 +641,43 @@ fn check_server_health(app: tauri::AppHandle, name: String) -> bool {
         let projects = state.projects.lock().unwrap();
         projects.iter().find(|p| p.name == name).map(|p| p.port)
     };
-    port.map(|p| {
+    let start = std::time::Instant::now();
+    let healthy = port.map(|p| {
         TcpStream::connect_timeout(
             &std::net::SocketAddr::from(([127, 0, 0, 1], p)),
             Duration::from_millis(200),
-        )
-        .is_ok()
-    })
-    .unwrap_or(false)
+        ).is_ok()
+    }).unwrap_or(false);
+    if healthy {
+        let latency = start.elapsed().as_millis() as u64;
+        state.latency_cache.lock().unwrap().insert(name, latency);
+    }
+    healthy
+}
+
+#[tauri::command]
+fn get_server_latency(app: tauri::AppHandle, name: String) -> Option<u64> {
+    let state = app.state::<ServerState>();
+    let result = state.latency_cache.lock().unwrap().get(&name).copied();
+    result
+}
+
+#[tauri::command]
+fn get_server_uptime(app: tauri::AppHandle, name: String) -> Option<u64> {
+    let state = app.state::<ServerState>();
+    let result = state.start_times.lock().unwrap().get(&name).map(|t| t.elapsed().as_secs());
+    result
+}
+
+#[tauri::command]
+fn get_server_logs(app: tauri::AppHandle, name: String) -> Vec<String> {
+    let state = app.state::<ServerState>();
+    let buffers = state.log_buffers.lock().unwrap();
+    if let Some(buf) = buffers.get(&name) {
+        buf.lock().unwrap().iter().cloned().collect()
+    } else {
+        Vec::new()
+    }
 }
 
 #[tauri::command]
@@ -652,18 +710,130 @@ fn set_pin(app: tauri::AppHandle, pinned: bool) -> Result<(), String> {
 
 #[tauri::command]
 fn refresh_projects_cmd(app: tauri::AppHandle) -> Vec<ProjectConfig> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+    let app_data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
     let overrides = load_port_overrides(&app_data_dir);
     let new_projects = scan_projects(Path::new(PROJECTS_DIR), &overrides);
-    {
-        let state = app.state::<ServerState>();
-        *state.projects.lock().unwrap() = new_projects.clone();
-    }
+    { let state = app.state::<ServerState>(); *state.projects.lock().unwrap() = new_projects.clone(); }
     rebuild_tray(&app);
     new_projects
+}
+
+#[tauri::command]
+fn get_project_readme(app: tauri::AppHandle, name: String) -> Option<String> {
+    let state = app.state::<ServerState>();
+    let projects = state.projects.lock().unwrap();
+    let project = projects.iter().find(|p| p.name == name)?;
+    for filename in &["README.md", "readme.md", "Readme.md"] {
+        let path = std::path::Path::new(&project.cwd).join(filename);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            // Return the first ~8 non-empty lines (skipping only the primary heading)
+            let lines: Vec<&str> = content
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .take(8)
+                .collect();
+            return Some(lines.join("\n").trim().to_string());
+        }
+    }
+    None
+}
+
+#[tauri::command]
+fn scan_external_servers(app: tauri::AppHandle) -> Vec<u16> {
+    let state = app.state::<ServerState>();
+    let known_ports: HashSet<u16> = {
+        let projects = state.projects.lock().unwrap();
+        projects.iter().flat_map(|p| {
+            let mut v = vec![p.port];
+            v.extend_from_slice(&p.extra_ports);
+            v
+        }).collect()
+    };
+    let probe_ports = [
+        3000u16, 3001, 3333, 4000, 4200, 4321, 5000, 5174, 5175,
+        7000, 8000, 8080, 8081, 8888, 9000, 9001, 9090,
+    ];
+    let mut external = Vec::new();
+    for &port in &probe_ports {
+        if known_ports.contains(&port) { continue; }
+        if TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            Duration::from_millis(100),
+        ).is_ok() {
+            external.push(port);
+        }
+    }
+    external
+}
+
+#[tauri::command]
+fn get_env_overrides(app: tauri::AppHandle, name: String) -> HashMap<String, String> {
+    let state = app.state::<ServerState>();
+    let result = state.env_overrides.lock().unwrap().get(&name).cloned().unwrap_or_default();
+    result
+}
+
+#[tauri::command]
+fn set_env_overrides(
+    app: tauri::AppHandle,
+    name: String,
+    vars: HashMap<String, String>,
+) -> Result<(), String> {
+    let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let state = app.state::<ServerState>();
+    let mut overrides = state.env_overrides.lock().unwrap();
+    overrides.insert(name, vars);
+    save_env_overrides_to_disk(&app_data_dir, &*overrides);
+    Ok(())
+}
+
+#[tauri::command]
+fn get_autostart_enabled() -> bool {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let plist_path = format!("{}/Library/LaunchAgents/com.dexhub.client.plist", home);
+    std::path::Path::new(&plist_path).exists()
+}
+
+#[tauri::command]
+fn set_autostart_enabled(enabled: bool) -> Result<(), String> {
+    let home = std::env::var("HOME").map_err(|e| e.to_string())?;
+    let agents_dir = format!("{}/Library/LaunchAgents", home);
+    let plist_path  = format!("{}/com.dexhub.client.plist", agents_dir);
+
+    if enabled {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let exe_str = exe.to_string_lossy();
+        let plist = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.dexhub.client</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+</dict>
+</plist>"#,
+            exe_str
+        );
+        std::fs::create_dir_all(&agents_dir).map_err(|e| e.to_string())?;
+        std::fs::write(&plist_path, plist).map_err(|e| e.to_string())?;
+        let _ = std::process::Command::new("launchctl")
+            .args(["load", &plist_path])
+            .output();
+    } else {
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", &plist_path])
+            .output();
+        let _ = std::fs::remove_file(&plist_path);
+    }
+    Ok(())
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -675,16 +845,21 @@ fn main() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
-            let app_data_dir = app.path().app_data_dir().expect("path failed");
-            let port_overrides = load_port_overrides(&app_data_dir);
-            let tailscale_host = get_tailscale_host();
-            let projects = scan_projects(Path::new(PROJECTS_DIR), &port_overrides);
-            let initial_menu = build_tray_menu(app, &projects, &[], &tailscale_host);
+            let app_data_dir    = app.path().app_data_dir().expect("path failed");
+            let port_overrides  = load_port_overrides(&app_data_dir);
+            let env_overrides   = load_env_overrides(&app_data_dir);
+            let tailscale_host  = get_tailscale_host();
+            let projects        = scan_projects(Path::new(PROJECTS_DIR), &port_overrides);
+            let initial_menu    = build_tray_menu(app, &projects, &[], &tailscale_host);
 
             app.manage(ServerState {
-                processes: Mutex::new(HashMap::new()),
-                projects: Mutex::new(projects),
+                processes:      Mutex::new(HashMap::new()),
+                start_times:    Mutex::new(HashMap::new()),
+                log_buffers:    Mutex::new(HashMap::new()),
+                latency_cache:  Mutex::new(HashMap::new()),
+                projects:       Mutex::new(projects),
                 tailscale_host,
+                env_overrides:  Mutex::new(env_overrides),
             });
 
             let tray = TrayIconBuilder::new()
@@ -696,15 +871,10 @@ fn main() {
                 .on_tray_icon_event(
                     |tray: &tauri::tray::TrayIcon<tauri::Wry>, event: TrayIconEvent| {
                         tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
-                        if let TrayIconEvent::Click {
-                            button: MouseButton::Left,
-                            ..
-                        } = event
-                        {
+                        if let TrayIconEvent::Click { button: MouseButton::Left, .. } = event {
                             if let Some(win) = tray.app_handle().get_webview_window("main") {
                                 let _ = tauri_plugin_positioner::WindowExt::move_window(
-                                    &win,
-                                    Position::TrayCenter,
+                                    &win, Position::TrayCenter,
                                 );
                                 if win.is_visible().unwrap_or(false) {
                                     let _ = win.hide();
@@ -727,15 +897,25 @@ fn main() {
             start_server_cmd,
             stop_server_cmd,
             stop_all_servers_cmd,
+            restart_server_cmd,
             update_server_port,
             open_terminal_here,
             get_server_url,
             check_server_health,
+            get_server_latency,
+            get_server_uptime,
+            get_server_logs,
             get_tailscale_address,
             get_favorites,
             set_favorites,
             set_pin,
             refresh_projects_cmd,
+            get_project_readme,
+            scan_external_servers,
+            get_env_overrides,
+            set_env_overrides,
+            get_autostart_enabled,
+            set_autostart_enabled,
         ])
         .build(tauri::generate_context!())
         .expect("error building tauri")
@@ -743,9 +923,7 @@ fn main() {
             if let tauri::RunEvent::Exit = event {
                 if let Some(state) = app.try_state::<ServerState>() {
                     let mut procs = state.processes.lock().unwrap();
-                    for (_, child) in procs.iter_mut() {
-                        let _ = child.kill();
-                    }
+                    for (_, child) in procs.iter_mut() { let _ = child.kill(); }
                 }
             }
         });

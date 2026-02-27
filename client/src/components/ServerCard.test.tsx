@@ -13,6 +13,8 @@ const baseProject: ProjectConfig = {
   command: 'npm',
   args: ['run', 'dev'],
   port: 5173,
+  default_port: 5173,
+  extra_ports: [],
   icon_path: null,
   icon_data: null,
   workspace: 'Root',
@@ -25,16 +27,27 @@ const defaultProps = {
   favorite: false,
   compact: false,
   portConflict: false,
-  onStart: vi.fn(),
-  onStop: vi.fn(),
+  allPorts: [5173],
+  onStart:          vi.fn(),
+  onStop:           vi.fn(),
+  onRestart:        vi.fn(),
   onToggleFavorite: vi.fn(),
-  onPortSaved: vi.fn(),
-  onShowQR: vi.fn(),
+  onPortSaved:      vi.fn(),
+  onShowQR:         vi.fn(),
 };
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mockInvoke.mockResolvedValue(undefined);
+  mockInvoke.mockImplementation((cmd: string) => {
+    switch (cmd) {
+      case 'get_server_logs':    return Promise.resolve([]);
+      case 'get_server_uptime':  return Promise.resolve(null);
+      case 'get_server_latency': return Promise.resolve(null);
+      case 'get_env_overrides':  return Promise.resolve({});
+      case 'get_project_readme': return Promise.resolve(null);
+      default:                   return Promise.resolve(undefined);
+    }
+  });
 });
 
 describe('ServerCard', () => {
@@ -133,17 +146,53 @@ describe('ServerCard', () => {
   });
 
   describe('compact mode', () => {
-    it('renders in compact layout', () => {
+    it('renders in compact layout with name and port', () => {
       render(<ServerCard {...defaultProps} compact />);
-      // Compact shows name and port
       expect(screen.getByText('my-app')).toBeInTheDocument();
       expect(screen.getByText(':5173')).toBeInTheDocument();
     });
 
-    it('does not show Open/URL/QR in compact mode', () => {
+    it('does not show text-labeled action buttons in compact mode', () => {
       render(<ServerCard {...defaultProps} compact running health="healthy" />);
+      // Compact mode uses icon-only buttons — no "Open" / "URL" text
       expect(screen.queryByText('Open')).not.toBeInTheDocument();
       expect(screen.queryByText('URL')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('restart button', () => {
+    it('shows restart button when running', () => {
+      const { container } = render(
+        <ServerCard {...defaultProps} running health="healthy" />,
+      );
+      expect(container.querySelector('[title="Restart server"]')).toBeInTheDocument();
+    });
+
+    it('calls onRestart when restart is clicked', () => {
+      const { container } = render(
+        <ServerCard {...defaultProps} running health="healthy" />,
+      );
+      const btn = container.querySelector('[title="Restart server"]') as HTMLButtonElement;
+      if (btn) fireEvent.click(btn);
+      expect(defaultProps.onRestart).toHaveBeenCalled();
+    });
+  });
+
+  describe('overridden port visual distinction', () => {
+    it('shows amber badge when port differs from default_port', () => {
+      const project = { ...baseProject, port: 3000, default_port: 5173 };
+      const { container } = render(<ServerCard {...defaultProps} project={project} />);
+      // The port button should have amber styling
+      const amberEl = container.querySelector('.text-amber-400');
+      expect(amberEl).toBeInTheDocument();
+    });
+  });
+
+  describe('extra ports', () => {
+    it('renders extra port badge for each extra port', () => {
+      const project = { ...baseProject, extra_ports: [3000] };
+      render(<ServerCard {...defaultProps} project={project} />);
+      expect(screen.getByText(':3000')).toBeInTheDocument();
     });
   });
 
