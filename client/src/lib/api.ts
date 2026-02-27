@@ -32,14 +32,3 @@ export async function deleteCard(id: string): Promise<void> {
     return invoke("delete_card", { id });
 }
 
-export async function sendSttRequest(audioBase64: string): Promise<string> {
-    return invoke("send_stt_request", { audioBase64 });
-}
-
-export async function sendTtsRequest(text: string): Promise<string> {
-    return invoke("send_tts_request", { text });
-}
-
-export async function confirmPairing(code: string): Promise<string> {
-    return invoke("confirm_pairing", { code });
-}

@@ -13,6 +13,15 @@ export default {
           secondary: "#f97316",
         },
       },
+      animation: {
+        'status-pulse': 'status-pulse 1.5s ease-in-out infinite',
+      },
+      keyframes: {
+        'status-pulse': {
+          '0%, 100%': { opacity: '1' },
+          '50%': { opacity: '0.3' },
+        },
+      },
     },
   },
   plugins: [],

@@ -4,19 +4,16 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tauri = { version = "2.0.0", features = ["tray-icon", "shell-open"] }
-reqwest = { version = "0.11", features = ["json"] }
-ed25519-dalek = "2.0"
-rand_core = { version = "0.6", features = ["std"] }
-chrono = "0.4"
-sha2 = "0.10"
+tauri = { version = "2.0.0", features = ["tray-icon"] }
 base64 = "0.21"
-keyring = "2"
-hex = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tauri-plugin-positioner = { version = "2.0.0", features = ["tray-icon"] }
-rusqlite = { version = "0.29.0", features = ["bundled-sqlcipher"] }
+walkdir = "2"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+tauri-build = { version = "2.0.0", features = [] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
