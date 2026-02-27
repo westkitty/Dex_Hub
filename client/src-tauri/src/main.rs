@@ -836,6 +836,52 @@ fn set_autostart_enabled(enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
+// ─── Tray Icon ────────────────────────────────────────────────────────────────
+
+/// Generates a 22×22 RGBA lightning-bolt icon (white on transparent).
+/// The bolt is drawn as two parallelogram bands that together form a ⚡ shape.
+/// macOS treats white-on-transparent images as "template images", automatically
+/// inverting them for dark/light menu-bar mode — so white renders correctly in both.
+fn lightning_bolt_icon_rgba() -> Vec<u8> {
+    const W: u32 = 22;
+    const H: u32 = 22;
+    let mut rgba = vec![0u8; (W * H * 4) as usize];
+
+    // Helper: paint a pixel white & fully opaque
+    let mut set = |x: u32, y: u32| {
+        if x < W && y < H {
+            let i = ((y * W + x) * 4) as usize;
+            rgba[i]     = 255; // R
+            rgba[i + 1] = 255; // G
+            rgba[i + 2] = 255; // B
+            rgba[i + 3] = 255; // A
+        }
+    };
+
+    // Upper blade: angled strip from top-right down to center-left
+    // Rows 0-10: a 4-pixel-wide stroke leaning left
+    for row in 0u32..=10 {
+        // Centre of stroke: column shifts from 16 down to 6 as row increases
+        let cx = 16u32.saturating_sub(row);
+        for dx in 0u32..4 {
+            set(cx + dx, row);
+        }
+    }
+
+    // Lower blade: angled strip from center-right down to bottom-left
+    // Rows 11-21: a 4-pixel-wide stroke leaning right
+    for row in 11u32..=21 {
+        let offset = row - 11;
+        // Centre of stroke: column shifts from 6 up to 16 as row increases
+        let cx = 6u32 + offset;
+        for dx in 0u32..4 {
+            set(cx.saturating_sub(2) + dx, row);
+        }
+    }
+
+    rgba
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 fn main() {
@@ -843,7 +889,7 @@ fn main() {
         .plugin(tauri_plugin_positioner::init())
         .setup(|app| {
             #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            app.set_activation_policy(tauri::ActivationPolicy::Regular);
 
             let app_data_dir    = app.path().app_data_dir().expect("path failed");
             let port_overrides  = load_port_overrides(&app_data_dir);
@@ -864,7 +910,7 @@ fn main() {
 
             let tray = TrayIconBuilder::new()
                 .menu(&initial_menu)
-                .icon(app.default_window_icon().unwrap().clone())
+                .icon(tauri::image::Image::new_owned(lightning_bolt_icon_rgba(), 22, 22))
                 .on_menu_event(|app: &tauri::AppHandle, event: tauri::menu::MenuEvent| {
                     handle_menu_event(app, event.id().as_ref());
                 })
