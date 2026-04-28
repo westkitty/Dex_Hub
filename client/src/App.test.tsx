@@ -25,6 +25,21 @@ beforeEach(() => {
       case 'get_server_latency':    return Promise.resolve(null);
       case 'get_env_overrides':     return Promise.resolve({});
       case 'get_project_readme':    return Promise.resolve(null);
+      case 'get_window_ring_settings':
+        return Promise.resolve({
+          enabled: true,
+          border_width: 6,
+          border_padding: 2,
+          default_color: { red: 0.85, green: 0.85, blue: 0.85, alpha: 0.95 },
+          app_colors: {},
+        });
+      case 'get_hammerspoon_status':
+        return Promise.resolve({
+          running: false,
+          installed: true,
+          status: 'Installed but not running',
+          settings_path: '~/.hammerspoon/dexhub_window_ring_settings.json',
+        });
       default:                      return Promise.resolve(undefined);
     }
   });
@@ -78,5 +93,16 @@ describe('App', () => {
     fireEvent.click(screen.getByRole('button', { name: /Dev Servers/ }));
     await act(async () => { await Promise.resolve(); });
     expect(screen.getByPlaceholderText('Search servers…')).toBeInTheDocument();
+  });
+
+  it('switches to settings view when Settings is clicked', async () => {
+    render(<App />);
+    await act(async () => { await Promise.resolve(); });
+
+    fireEvent.click(screen.getByRole('button', { name: /Settings/ }));
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByRole('heading', { name: 'Settings' })).toBeInTheDocument();
+    expect(screen.getAllByText('Window Ring').length).toBeGreaterThan(0);
   });
 });

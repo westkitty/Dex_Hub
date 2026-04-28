@@ -5,12 +5,35 @@ export interface ProjectConfig {
   cwd: string;
   command: string;
   args: string[];
+  host?: string | null;
   port: number;
   default_port: number;        // original port before user override
   extra_ports: number[];       // additional ports from dexhub.ports in package.json
   icon_path: string | null;
   icon_data: string | null;    // data:image/png;base64,… for webview display
   workspace: string;           // parent dir name for grouping
+}
+
+export interface RingColor {
+  red: number;
+  green: number;
+  blue: number;
+  alpha: number;
+}
+
+export interface WindowRingSettings {
+  enabled: boolean;
+  border_width: number;
+  border_padding: number;
+  default_color: RingColor;
+  app_colors: Record<string, RingColor>;
+}
+
+export interface HammerspoonStatus {
+  running: boolean;
+  installed: boolean;
+  status: string;
+  settings_path: string;
 }
 
 // ─── Core project/server commands ────────────────────────────────────────────
@@ -105,3 +128,20 @@ export const getAutostartEnabled = (): Promise<boolean> =>
 
 export const setAutostartEnabled = (enabled: boolean): Promise<void> =>
   invoke('set_autostart_enabled', { enabled });
+
+// ─── Window Ring / Hammerspoon ──────────────────────────────────────────────
+
+export const getWindowRingSettings = (): Promise<WindowRingSettings> =>
+  invoke('get_window_ring_settings');
+
+export const saveWindowRingSettings = (settings: WindowRingSettings): Promise<void> =>
+  invoke('save_window_ring_settings', { settings });
+
+export const applyWindowRingSettings = (settings: WindowRingSettings): Promise<string> =>
+  invoke('apply_window_ring_settings', { settings });
+
+export const getHammerspoonStatus = (): Promise<HammerspoonStatus> =>
+  invoke('get_hammerspoon_status');
+
+export const launchHammerspoon = (): Promise<void> =>
+  invoke('launch_hammerspoon');

@@ -1,7 +1,7 @@
 use base64::{engine::general_purpose, Engine as _};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::process::Child;
 use std::sync::{Arc, Mutex};
@@ -28,20 +28,46 @@ struct ProjectConfig {
     cwd: String,
     command: String,
     args: Vec<String>,
+    host: Option<String>,
     port: u16,
-    default_port: u16,       // original scanned port before any user override
-    extra_ports: Vec<u16>,   // additional ports from dexhub.ports in package.json
+    default_port: u16,     // original scanned port before any user override
+    extra_ports: Vec<u16>, // additional ports from dexhub.ports in package.json
     icon_path: Option<String>,
     icon_data: Option<String>,
     workspace: String,
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct RingColor {
+    red: f64,
+    green: f64,
+    blue: f64,
+    alpha: f64,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct WindowRingSettings {
+    enabled: bool,
+    border_width: u32,
+    border_padding: u32,
+    default_color: RingColor,
+    app_colors: HashMap<String, RingColor>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct HammerspoonStatus {
+    running: bool,
+    installed: bool,
+    status: String,
+    settings_path: String,
+}
+
 struct ServerState {
-    processes:     Mutex<HashMap<String, Child>>,
-    start_times:   Mutex<HashMap<String, std::time::Instant>>,
-    log_buffers:   Mutex<HashMap<String, LogBuffer>>,
+    processes: Mutex<HashMap<String, Child>>,
+    start_times: Mutex<HashMap<String, std::time::Instant>>,
+    log_buffers: Mutex<HashMap<String, LogBuffer>>,
     latency_cache: Mutex<HashMap<String, u64>>,
-    projects:      Mutex<Vec<ProjectConfig>>,
+    projects: Mutex<Vec<ProjectConfig>>,
     tailscale_host: String,
     env_overrides: Mutex<HashMap<String, HashMap<String, String>>>,
 }
@@ -82,16 +108,22 @@ fn get_tailscale_host() -> String {
 
 fn extract_port_after(text: &str, key: &str) -> Option<u16> {
     let idx = text.find(key)?;
-    let after = text[idx + key.len()..]
-        .trim_start_matches(|c: char| c == ':' || c.is_whitespace());
+    let after = text[idx + key.len()..].trim_start_matches(|c: char| c == ':' || c.is_whitespace());
     let end = after
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(after.len());
-    if end == 0 { return None; }
+    if end == 0 {
+        return None;
+    }
     after[..end].parse().ok()
 }
 
-fn extract_port(project_dir: &Path) -> u16 {
+fn extract_port(project_dir: &Path, package_json: &serde_json::Value) -> u16 {
+    if let Some(port) = package_json["dexhub"]["port"].as_u64() {
+        if let Ok(port) = u16::try_from(port) {
+            return port;
+        }
+    }
     for cfg in &["vite.config.ts", "vite.config.js", "vite.config.mts"] {
         if let Ok(content) = std::fs::read_to_string(project_dir.join(cfg)) {
             if let Some(p) = extract_port_after(&content, "port:") {
@@ -99,13 +131,9 @@ fn extract_port(project_dir: &Path) -> u16 {
             }
         }
     }
-    if let Ok(content) = std::fs::read_to_string(project_dir.join("package.json")) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(script) = val["scripts"]["dev"].as_str() {
-                if let Some(p) = extract_port_after(script, "--port") {
-                    return p;
-                }
-            }
+    if let Some(script) = package_json["scripts"]["dev"].as_str() {
+        if let Some(p) = extract_port_after(script, "--port") {
+            return p;
         }
     }
     5173
@@ -115,16 +143,42 @@ fn extract_port(project_dir: &Path) -> u16 {
 
 fn extract_workspace(cwd: &str) -> String {
     let base = PROJECTS_DIR.trim_end_matches('/');
-    let rest = cwd
-        .strip_prefix(base)
-        .unwrap_or("")
-        .trim_start_matches('/');
+    let rest = cwd.strip_prefix(base).unwrap_or("").trim_start_matches('/');
     let parts: Vec<&str> = rest.splitn(2, '/').collect();
     if parts.len() >= 2 && !parts[1].is_empty() {
         parts[0].to_string()
     } else {
         "Root".to_string()
     }
+}
+
+fn project_workspace(project_dir: &Path, package_json: &serde_json::Value) -> String {
+    if let Some(workspace) = package_json["dexhub"]["workspace"].as_str() {
+        if !workspace.trim().is_empty() {
+            return workspace.trim().to_string();
+        }
+    }
+    extract_workspace(&project_dir.to_string_lossy())
+}
+
+fn project_host(package_json: &serde_json::Value) -> Option<String> {
+    package_json["dexhub"]["host"]
+        .as_str()
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(|host| host.to_string())
+}
+
+fn project_url(project: &ProjectConfig, default_host: &str) -> String {
+    let host = project.host.as_deref().unwrap_or(default_host);
+    format!("http://{}:{}", host, project.port)
+}
+
+fn tcp_reachable(host: &str, port: u16, timeout: Duration) -> bool {
+    (host, port)
+        .to_socket_addrs()
+        .map(|mut addrs| addrs.any(|addr| TcpStream::connect_timeout(&addr, timeout).is_ok()))
+        .unwrap_or(false)
 }
 
 // ─── Icon Helpers ─────────────────────────────────────────────────────────────
@@ -246,6 +300,184 @@ fn save_env_overrides_to_disk(
     }
 }
 
+// ─── Window Ring Settings Helpers ───────────────────────────────────────────
+
+fn default_ring_color(red: f64, green: f64, blue: f64, alpha: f64) -> RingColor {
+    RingColor {
+        red,
+        green,
+        blue,
+        alpha,
+    }
+}
+
+fn default_window_ring_settings() -> WindowRingSettings {
+    let mut app_colors: HashMap<String, RingColor> = HashMap::new();
+    app_colors.insert(
+        "Safari".to_string(),
+        default_ring_color(0.18, 0.62, 0.95, 0.95),
+    );
+    app_colors.insert(
+        "Finder".to_string(),
+        default_ring_color(0.25, 0.72, 0.45, 0.95),
+    );
+    app_colors.insert(
+        "Terminal".to_string(),
+        default_ring_color(0.15, 0.85, 0.35, 0.95),
+    );
+    app_colors.insert(
+        "iTerm2".to_string(),
+        default_ring_color(0.15, 0.85, 0.35, 0.95),
+    );
+    app_colors.insert(
+        "Visual Studio Code".to_string(),
+        default_ring_color(0.00, 0.48, 1.00, 0.95),
+    );
+    app_colors.insert(
+        "Xcode".to_string(),
+        default_ring_color(1.00, 0.42, 0.10, 0.95),
+    );
+    app_colors.insert(
+        "Slack".to_string(),
+        default_ring_color(0.67, 0.28, 0.74, 0.95),
+    );
+    app_colors.insert(
+        "Arc".to_string(),
+        default_ring_color(0.90, 0.35, 0.24, 0.95),
+    );
+    app_colors.insert(
+        "Chrome".to_string(),
+        default_ring_color(0.95, 0.75, 0.10, 0.95),
+    );
+
+    WindowRingSettings {
+        enabled: true,
+        border_width: 6,
+        border_padding: 2,
+        default_color: default_ring_color(0.85, 0.85, 0.85, 0.95),
+        app_colors,
+    }
+}
+
+fn clamp_unit(v: f64) -> f64 {
+    if v.is_nan() {
+        0.0
+    } else if v < 0.0 {
+        0.0
+    } else if v > 1.0 {
+        1.0
+    } else {
+        v
+    }
+}
+
+fn normalize_ring_color(color: &RingColor) -> RingColor {
+    RingColor {
+        red: clamp_unit(color.red),
+        green: clamp_unit(color.green),
+        blue: clamp_unit(color.blue),
+        alpha: clamp_unit(color.alpha),
+    }
+}
+
+fn normalize_window_ring_settings(settings: &WindowRingSettings) -> WindowRingSettings {
+    let mut app_colors: HashMap<String, RingColor> = HashMap::new();
+    for (name, color) in &settings.app_colors {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        app_colors.insert(trimmed.to_string(), normalize_ring_color(color));
+    }
+
+    WindowRingSettings {
+        enabled: settings.enabled,
+        border_width: settings.border_width.clamp(1, 24),
+        border_padding: settings.border_padding.clamp(0, 24),
+        default_color: normalize_ring_color(&settings.default_color),
+        app_colors,
+    }
+}
+
+fn window_ring_settings_path(app_data_dir: &Path) -> std::path::PathBuf {
+    app_data_dir.join("window_ring_settings.json")
+}
+
+fn hammerspoon_window_ring_settings_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    Path::new(&home)
+        .join(".hammerspoon")
+        .join("dexhub_window_ring_settings.json")
+}
+
+fn load_window_ring_settings_from(path: &Path) -> Option<WindowRingSettings> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let parsed = serde_json::from_str::<WindowRingSettings>(&content).ok()?;
+    Some(normalize_window_ring_settings(&parsed))
+}
+
+fn load_window_ring_settings(app_data_dir: &Path) -> WindowRingSettings {
+    let local = window_ring_settings_path(app_data_dir);
+    if let Some(settings) = load_window_ring_settings_from(&local) {
+        return settings;
+    }
+
+    let hs_path = hammerspoon_window_ring_settings_path();
+    if let Some(settings) = load_window_ring_settings_from(&hs_path) {
+        return settings;
+    }
+
+    default_window_ring_settings()
+}
+
+fn save_window_ring_settings_to_paths(
+    app_data_dir: &Path,
+    settings: &WindowRingSettings,
+) -> Result<(), String> {
+    let normalized = normalize_window_ring_settings(settings);
+    let serialized = serde_json::to_string_pretty(&normalized).map_err(|e| e.to_string())?;
+
+    let app_data_path = window_ring_settings_path(app_data_dir);
+    if let Some(parent) = app_data_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&app_data_path, &serialized).map_err(|e| e.to_string())?;
+
+    let hs_path = hammerspoon_window_ring_settings_path();
+    if let Some(parent) = hs_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(&hs_path, &serialized).map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+fn is_hammerspoon_running() -> bool {
+    std::process::Command::new("pgrep")
+        .args(["-x", "Hammerspoon"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn is_hammerspoon_installed() -> bool {
+    Path::new("/Applications/Hammerspoon.app").exists()
+        || Path::new("/opt/homebrew/bin/hs").exists()
+        || Path::new("/usr/local/bin/hs").exists()
+}
+
+fn trigger_hammerspoon_reload() -> Result<(), String> {
+    let status = std::process::Command::new("open")
+        .arg("hammerspoon://reloadConfig")
+        .status()
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Failed to trigger hammerspoon://reloadConfig".to_string())
+    }
+}
+
 // ─── Crash Notification ───────────────────────────────────────────────────────
 
 fn notify_crash(name: &str) {
@@ -261,8 +493,91 @@ fn notify_crash(name: &str) {
 
 // ─── Project Scanner ──────────────────────────────────────────────────────────
 
+fn load_project_from_dir(
+    project_dir: &Path,
+    port_overrides: &HashMap<String, u16>,
+) -> Option<ProjectConfig> {
+    // Skip Tauri apps — launching them would conflict with the host
+    if project_dir.join("src-tauri").join("tauri.conf.json").exists() {
+        return None;
+    }
+
+    let pkg_path = project_dir.join("package.json");
+    let content = std::fs::read_to_string(pkg_path).ok()?;
+    let val: serde_json::Value = serde_json::from_str(&content).ok()?;
+
+    let dev_script = match val["scripts"]["dev"].as_str() {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => return None,
+    };
+
+    let name = val["name"]
+        .as_str()
+        .unwrap_or_else(|| {
+            project_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+        })
+        .to_string();
+    if name.trim().is_empty() {
+        return None;
+    }
+
+    let (command, args) = if dev_script.trim_start().starts_with("pnpm") {
+        let rest = dev_script.trim_start_matches("pnpm").trim().to_string();
+        let pnpm_args: Vec<String> = if rest.is_empty() {
+            vec!["dev".to_string()]
+        } else {
+            rest.split_whitespace().map(|s| s.to_string()).collect()
+        };
+        ("pnpm".to_string(), pnpm_args)
+    } else {
+        (
+            "npm".to_string(),
+            vec!["run".to_string(), "dev".to_string()],
+        )
+    };
+
+    let default_port = extract_port(project_dir, &val);
+    let mut port = default_port;
+    if let Some(&override_port) = port_overrides.get(&name) {
+        port = override_port;
+    }
+
+    let extra_ports: Vec<u16> = val["dexhub"]["ports"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_u64().and_then(|p| u16::try_from(p).ok()))
+                .filter(|&p| p != port)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let icon_path = find_icon(project_dir);
+    let icon_data = icon_path.as_ref().and_then(|p| icon_to_base64(p));
+    let workspace = project_workspace(project_dir, &val);
+    let host = project_host(&val);
+
+    Some(ProjectConfig {
+        name,
+        cwd: project_dir.to_string_lossy().into_owned(),
+        command,
+        args,
+        host,
+        port,
+        default_port,
+        extra_ports,
+        icon_path,
+        icon_data,
+        workspace,
+    })
+}
+
 fn scan_projects(base_dir: &Path, port_overrides: &HashMap<String, u16>) -> Vec<ProjectConfig> {
     let mut projects = Vec::new();
+    let mut seen = HashSet::new();
 
     let walker = WalkDir::new(base_dir)
         .min_depth(1)
@@ -282,67 +597,20 @@ fn scan_projects(base_dir: &Path, port_overrides: &HashMap<String, u16>) -> Vec<
         });
 
     for entry in walker.filter_map(|e| e.ok()) {
-        if entry.file_name() != "package.json" { continue; }
+        if entry.file_name() != "package.json" {
+            continue;
+        }
 
-        let pkg_path = entry.path();
-        let project_dir = match pkg_path.parent() { Some(d) => d, None => continue };
-
-        // Skip Tauri apps — launching them would conflict with the host
-        if project_dir.join("src-tauri").join("tauri.conf.json").exists() { continue; }
-
-        let content = match std::fs::read_to_string(pkg_path) { Ok(c) => c, Err(_) => continue };
-        let val: serde_json::Value = match serde_json::from_str(&content) { Ok(v) => v, Err(_) => continue };
-
-        let dev_script = match val["scripts"]["dev"].as_str() {
-            Some(s) if !s.trim().is_empty() => s.to_string(),
-            _ => continue,
+        let project_dir = match entry.path().parent() {
+            Some(d) => d,
+            None => continue,
         };
-
-        let name = val["name"]
-            .as_str()
-            .unwrap_or_else(|| {
-                project_dir.file_name().and_then(|n| n.to_str()).unwrap_or("unknown")
-            })
-            .to_string();
-        if name.trim().is_empty() { continue; }
-
-        let (command, args) = if dev_script.trim_start().starts_with("pnpm") {
-            let rest = dev_script.trim_start_matches("pnpm").trim().to_string();
-            let pnpm_args: Vec<String> = if rest.is_empty() {
-                vec!["dev".to_string()]
-            } else {
-                rest.split_whitespace().map(|s| s.to_string()).collect()
-            };
-            ("pnpm".to_string(), pnpm_args)
-        } else {
-            ("npm".to_string(), vec!["run".to_string(), "dev".to_string()])
-        };
-
-        // default_port = what the project declares; port = after override
-        let default_port = extract_port(project_dir);
-        let mut port = default_port;
-        if let Some(&override_port) = port_overrides.get(&name) { port = override_port; }
-
-        // Extra ports declared via  "dexhub": { "ports": [3000, 5173] }  in package.json
-        let extra_ports: Vec<u16> = val["dexhub"]["ports"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_u64().map(|p| p as u16))
-                    .filter(|&p| p != port)
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        let icon_path = find_icon(project_dir);
-        let icon_data = icon_path.as_ref().and_then(|p| icon_to_base64(p));
-        let workspace = extract_workspace(&project_dir.to_string_lossy());
-
-        projects.push(ProjectConfig {
-            name, cwd: project_dir.to_string_lossy().into_owned(),
-            command, args, port, default_port, extra_ports,
-            icon_path, icon_data, workspace,
-        });
+        let key = project_dir.to_string_lossy().into_owned();
+        if seen.insert(key.clone()) {
+            if let Some(project) = load_project_from_dir(project_dir, port_overrides) {
+                projects.push(project);
+            }
+        }
     }
 
     projects.sort_by(|a, b| a.name.cmp(&b.name));
@@ -358,54 +626,114 @@ fn build_tray_menu<M: tauri::Manager<tauri::Wry>>(
     tailscale_host: &str,
 ) -> Menu<tauri::Wry> {
     let menu = Menu::new(manager).expect("menu");
-    menu.append(&PredefinedMenuItem::separator(manager).expect("sep")).ok();
+    menu.append(&PredefinedMenuItem::separator(manager).expect("sep"))
+        .ok();
     menu.append(
-        &MenuItem::with_id(manager, "_header_", "─── Servers ───", false, None::<&str>).expect("header"),
-    ).ok();
+        &MenuItem::with_id(manager, "_header_", "─── Servers ───", false, None::<&str>)
+            .expect("header"),
+    )
+    .ok();
 
     for project in projects {
         let is_running = running_names.iter().any(|n| n == &project.name);
         if is_running {
-            let url   = format!("http://{}:{}", tailscale_host, project.port);
+            let url = project_url(project, tailscale_host);
             let label = format!("● {}", project.name);
-            let sub   = Submenu::new(manager, &label, true).expect("submenu");
-            sub.append(&MenuItem::with_id(manager, format!("open__{}", project.name), "Open in Browser", true, None::<&str>).expect("open")).ok();
-            sub.append(&MenuItem::with_id(manager, format!("url__{}", project.name), &url, true, None::<&str>).expect("url")).ok();
-            sub.append(&MenuItem::with_id(manager, format!("stop__{}", project.name), "Stop", true, None::<&str>).expect("stop")).ok();
+            let sub = Submenu::new(manager, &label, true).expect("submenu");
+            sub.append(
+                &MenuItem::with_id(
+                    manager,
+                    format!("open__{}", project.name),
+                    "Open in Browser",
+                    true,
+                    None::<&str>,
+                )
+                .expect("open"),
+            )
+            .ok();
+            sub.append(
+                &MenuItem::with_id(
+                    manager,
+                    format!("url__{}", project.name),
+                    &url,
+                    true,
+                    None::<&str>,
+                )
+                .expect("url"),
+            )
+            .ok();
+            sub.append(
+                &MenuItem::with_id(
+                    manager,
+                    format!("stop__{}", project.name),
+                    "Stop",
+                    true,
+                    None::<&str>,
+                )
+                .expect("stop"),
+            )
+            .ok();
             menu.append(&sub).ok();
         } else {
             let start_id = format!("start__{}", project.name);
             let mut added = false;
             if let Some(icon_path) = &project.icon_path {
                 if let Some(icon) = load_icon_image(icon_path) {
-                    if let Ok(item) = IconMenuItem::with_id(manager, &start_id, &project.name, true, Some(icon), None::<&str>) {
+                    if let Ok(item) = IconMenuItem::with_id(
+                        manager,
+                        &start_id,
+                        &project.name,
+                        true,
+                        Some(icon),
+                        None::<&str>,
+                    ) {
                         menu.append(&item).ok();
                         added = true;
                     }
                 }
             }
             if !added {
-                menu.append(&MenuItem::with_id(manager, &start_id, &project.name, true, None::<&str>).expect("start")).ok();
+                menu.append(
+                    &MenuItem::with_id(manager, &start_id, &project.name, true, None::<&str>)
+                        .expect("start"),
+                )
+                .ok();
             }
         }
     }
 
-    menu.append(&PredefinedMenuItem::separator(manager).expect("sep")).ok();
-    menu.append(&MenuItem::with_id(manager, "refresh", "Refresh", true, None::<&str>).expect("refresh")).ok();
-    menu.append(&PredefinedMenuItem::separator(manager).expect("sep")).ok();
-    menu.append(&MenuItem::with_id(manager, "quit", "Quit DexHub", true, None::<&str>).expect("quit")).ok();
+    menu.append(&PredefinedMenuItem::separator(manager).expect("sep"))
+        .ok();
+    menu.append(
+        &MenuItem::with_id(manager, "refresh", "Refresh", true, None::<&str>).expect("refresh"),
+    )
+    .ok();
+    menu.append(&PredefinedMenuItem::separator(manager).expect("sep"))
+        .ok();
+    menu.append(
+        &MenuItem::with_id(manager, "quit", "Quit DexHub", true, None::<&str>).expect("quit"),
+    )
+    .ok();
     menu
 }
 
 fn rebuild_tray(app: &tauri::AppHandle) {
     let server_state = app.state::<ServerState>();
-    let tray_handle  = app.state::<TrayHandle>();
-    let running: Vec<String> = server_state.processes.lock().unwrap().keys().cloned().collect();
+    let tray_handle = app.state::<TrayHandle>();
+    let running: Vec<String> = server_state
+        .processes
+        .lock()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
     let projects: Vec<ProjectConfig> = server_state.projects.lock().unwrap().clone();
     let ts_host = server_state.tailscale_host.clone();
     let new_menu = build_tray_menu(app, &projects, &running, &ts_host);
     let guard = tray_handle.0.lock().unwrap();
-    if let Some(tray) = guard.as_ref() { let _ = tray.set_menu(Some(new_menu)); }
+    if let Some(tray) = guard.as_ref() {
+        let _ = tray.set_menu(Some(new_menu));
+    }
 }
 
 // ─── Menu Event Handler ───────────────────────────────────────────────────────
@@ -414,11 +742,16 @@ fn handle_menu_event(app: &tauri::AppHandle, id: &str) {
     if id == "quit" {
         let state = app.state::<ServerState>();
         let mut procs = state.processes.lock().unwrap();
-        for (_, child) in procs.iter_mut() { let _ = child.kill(); }
+        for (_, child) in procs.iter_mut() {
+            let _ = child.kill();
+        }
         drop(procs);
         app.exit(0);
     } else if id == "refresh" {
-        let app_data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+        let app_data_dir = app
+            .path()
+            .app_data_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
         let overrides = load_port_overrides(&app_data_dir);
         let state = app.state::<ServerState>();
         *state.projects.lock().unwrap() = scan_projects(Path::new(PROJECTS_DIR), &overrides);
@@ -462,7 +795,9 @@ fn start_server(app: &tauri::AppHandle, name: String) {
         .current_dir(&project.cwd)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    for (k, v) in &env_vars { cmd.env(k, v); }
+    for (k, v) in &env_vars {
+        cmd.env(k, v);
+    }
 
     match cmd.spawn() {
         Ok(mut child) => {
@@ -476,7 +811,9 @@ fn start_server(app: &tauri::AppHandle, name: String) {
                     for line in BufReader::new(stdout).lines() {
                         if let Ok(l) = line {
                             let mut b = buf.lock().unwrap();
-                            if b.len() >= 500 { b.pop_front(); }
+                            if b.len() >= 500 {
+                                b.pop_front();
+                            }
                             b.push_back(l);
                         }
                     }
@@ -489,7 +826,9 @@ fn start_server(app: &tauri::AppHandle, name: String) {
                     for line in BufReader::new(stderr).lines() {
                         if let Ok(l) = line {
                             let mut b = buf.lock().unwrap();
-                            if b.len() >= 500 { b.pop_front(); }
+                            if b.len() >= 500 {
+                                b.pop_front();
+                            }
                             b.push_back(format!("[err] {}", l));
                         }
                     }
@@ -520,7 +859,7 @@ fn open_in_browser(app: &tauri::AppHandle, name: String) {
     let state = app.state::<ServerState>();
     let projects = state.projects.lock().unwrap().clone();
     if let Some(project) = projects.iter().find(|p| p.name == name) {
-        let url = format!("http://{}:{}", state.tailscale_host, project.port);
+        let url = project_url(project, &state.tailscale_host);
         let _ = std::process::Command::new("open").arg(&url).spawn();
     }
 }
@@ -529,7 +868,7 @@ fn copy_url(app: &tauri::AppHandle, name: String) {
     let state = app.state::<ServerState>();
     let projects = state.projects.lock().unwrap().clone();
     if let Some(project) = projects.iter().find(|p| p.name == name) {
-        let url = format!("http://{}:{}", state.tailscale_host, project.port);
+        let url = project_url(project, &state.tailscale_host);
         let _ = std::process::Command::new("bash")
             .args(["-c", &format!("echo -n '{}' | pbcopy", url)])
             .spawn();
@@ -557,9 +896,13 @@ fn get_running_servers(app: tauri::AppHandle) -> Vec<String> {
     };
     if !crashed_names.is_empty() {
         let mut start_times = state.start_times.lock().unwrap();
-        for n in &crashed_names { start_times.remove(n); }
+        for n in &crashed_names {
+            start_times.remove(n);
+        }
         drop(start_times);
-        for n in &crashed_names { notify_crash(n); }
+        for n in &crashed_names {
+            notify_crash(n);
+        }
         rebuild_tray(&app);
     }
     names
@@ -591,7 +934,9 @@ fn stop_all_servers_cmd(app: tauri::AppHandle) -> Result<(), String> {
     {
         let state = app.state::<ServerState>();
         let mut procs = state.processes.lock().unwrap();
-        for (_, child) in procs.iter_mut() { let _ = child.kill(); }
+        for (_, child) in procs.iter_mut() {
+            let _ = child.kill();
+        }
         procs.clear();
         state.start_times.lock().unwrap().clear();
     }
@@ -607,7 +952,9 @@ fn update_server_port(app: tauri::AppHandle, name: String, port: u16) -> Result<
     save_port_overrides(&app_data_dir, &overrides);
     let state = app.state::<ServerState>();
     let mut projects = state.projects.lock().unwrap();
-    if let Some(p) = projects.iter_mut().find(|p| p.name == name) { p.port = port; }
+    if let Some(p) = projects.iter_mut().find(|p| p.name == name) {
+        p.port = port;
+    }
     Ok(())
 }
 
@@ -629,7 +976,7 @@ fn get_server_url(app: tauri::AppHandle, name: String) -> Result<String, String>
     let state = app.state::<ServerState>();
     let projects = state.projects.lock().unwrap().clone();
     match projects.iter().find(|p| p.name == name) {
-        Some(project) => Ok(format!("http://{}:{}", state.tailscale_host, project.port)),
+        Some(project) => Ok(project_url(project, &state.tailscale_host)),
         None => Err(format!("Project '{}' not found", name)),
     }
 }
@@ -637,17 +984,17 @@ fn get_server_url(app: tauri::AppHandle, name: String) -> Result<String, String>
 #[tauri::command]
 fn check_server_health(app: tauri::AppHandle, name: String) -> bool {
     let state = app.state::<ServerState>();
-    let port = {
+    let target = {
         let projects = state.projects.lock().unwrap();
-        projects.iter().find(|p| p.name == name).map(|p| p.port)
+        projects
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| (p.host.clone().unwrap_or_else(|| "127.0.0.1".to_string()), p.port))
     };
     let start = std::time::Instant::now();
-    let healthy = port.map(|p| {
-        TcpStream::connect_timeout(
-            &std::net::SocketAddr::from(([127, 0, 0, 1], p)),
-            Duration::from_millis(200),
-        ).is_ok()
-    }).unwrap_or(false);
+    let healthy = target
+        .map(|(host, port)| tcp_reachable(&host, port, Duration::from_millis(400)))
+        .unwrap_or(false);
     if healthy {
         let latency = start.elapsed().as_millis() as u64;
         state.latency_cache.lock().unwrap().insert(name, latency);
@@ -665,7 +1012,12 @@ fn get_server_latency(app: tauri::AppHandle, name: String) -> Option<u64> {
 #[tauri::command]
 fn get_server_uptime(app: tauri::AppHandle, name: String) -> Option<u64> {
     let state = app.state::<ServerState>();
-    let result = state.start_times.lock().unwrap().get(&name).map(|t| t.elapsed().as_secs());
+    let result = state
+        .start_times
+        .lock()
+        .unwrap()
+        .get(&name)
+        .map(|t| t.elapsed().as_secs());
     result
 }
 
@@ -710,10 +1062,16 @@ fn set_pin(app: tauri::AppHandle, pinned: bool) -> Result<(), String> {
 
 #[tauri::command]
 fn refresh_projects_cmd(app: tauri::AppHandle) -> Vec<ProjectConfig> {
-    let app_data_dir = app.path().app_data_dir().unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"));
     let overrides = load_port_overrides(&app_data_dir);
     let new_projects = scan_projects(Path::new(PROJECTS_DIR), &overrides);
-    { let state = app.state::<ServerState>(); *state.projects.lock().unwrap() = new_projects.clone(); }
+    {
+        let state = app.state::<ServerState>();
+        *state.projects.lock().unwrap() = new_projects.clone();
+    }
     rebuild_tray(&app);
     new_projects
 }
@@ -743,23 +1101,30 @@ fn scan_external_servers(app: tauri::AppHandle) -> Vec<u16> {
     let state = app.state::<ServerState>();
     let known_ports: HashSet<u16> = {
         let projects = state.projects.lock().unwrap();
-        projects.iter().flat_map(|p| {
-            let mut v = vec![p.port];
-            v.extend_from_slice(&p.extra_ports);
-            v
-        }).collect()
+        projects
+            .iter()
+            .flat_map(|p| {
+                let mut v = vec![p.port];
+                v.extend_from_slice(&p.extra_ports);
+                v
+            })
+            .collect()
     };
     let probe_ports = [
-        3000u16, 3001, 3333, 4000, 4200, 4321, 5000, 5174, 5175,
-        7000, 8000, 8080, 8081, 8888, 9000, 9001, 9090,
+        3000u16, 3001, 3333, 4000, 4200, 4321, 5000, 5174, 5175, 7000, 8000, 8080, 8081, 8888,
+        9000, 9001, 9090,
     ];
     let mut external = Vec::new();
     for &port in &probe_ports {
-        if known_ports.contains(&port) { continue; }
+        if known_ports.contains(&port) {
+            continue;
+        }
         if TcpStream::connect_timeout(
             &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
             Duration::from_millis(100),
-        ).is_ok() {
+        )
+        .is_ok()
+        {
             external.push(port);
         }
     }
@@ -769,7 +1134,13 @@ fn scan_external_servers(app: tauri::AppHandle) -> Vec<u16> {
 #[tauri::command]
 fn get_env_overrides(app: tauri::AppHandle, name: String) -> HashMap<String, String> {
     let state = app.state::<ServerState>();
-    let result = state.env_overrides.lock().unwrap().get(&name).cloned().unwrap_or_default();
+    let result = state
+        .env_overrides
+        .lock()
+        .unwrap()
+        .get(&name)
+        .cloned()
+        .unwrap_or_default();
     result
 }
 
@@ -798,7 +1169,7 @@ fn get_autostart_enabled() -> bool {
 fn set_autostart_enabled(enabled: bool) -> Result<(), String> {
     let home = std::env::var("HOME").map_err(|e| e.to_string())?;
     let agents_dir = format!("{}/Library/LaunchAgents", home);
-    let plist_path  = format!("{}/com.dexhub.client.plist", agents_dir);
+    let plist_path = format!("{}/com.dexhub.client.plist", agents_dir);
 
     if enabled {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -836,6 +1207,71 @@ fn set_autostart_enabled(enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn get_window_ring_settings(app: tauri::AppHandle) -> Result<WindowRingSettings, String> {
+    let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    Ok(load_window_ring_settings(&app_data_dir))
+}
+
+#[tauri::command]
+fn save_window_ring_settings(
+    app: tauri::AppHandle,
+    settings: WindowRingSettings,
+) -> Result<(), String> {
+    let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    save_window_ring_settings_to_paths(&app_data_dir, &settings)
+}
+
+#[tauri::command]
+fn apply_window_ring_settings(
+    app: tauri::AppHandle,
+    settings: WindowRingSettings,
+) -> Result<String, String> {
+    let app_data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    save_window_ring_settings_to_paths(&app_data_dir, &settings)?;
+
+    if !is_hammerspoon_running() {
+        return Err("Hammerspoon is not running. Launch it, then retry Apply.".to_string());
+    }
+
+    trigger_hammerspoon_reload()?;
+    Ok("Applied. Triggered hammerspoon://reloadConfig.".to_string())
+}
+
+#[tauri::command]
+fn get_hammerspoon_status() -> HammerspoonStatus {
+    let running = is_hammerspoon_running();
+    let installed = is_hammerspoon_installed();
+    let status = if running {
+        "Running".to_string()
+    } else if installed {
+        "Installed but not running".to_string()
+    } else {
+        "Hammerspoon not detected".to_string()
+    };
+    HammerspoonStatus {
+        running,
+        installed,
+        status,
+        settings_path: hammerspoon_window_ring_settings_path()
+            .to_string_lossy()
+            .into_owned(),
+    }
+}
+
+#[tauri::command]
+fn launch_hammerspoon() -> Result<(), String> {
+    let status = std::process::Command::new("open")
+        .args(["-a", "Hammerspoon"])
+        .status()
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("Could not launch Hammerspoon.".to_string())
+    }
+}
+
 // ─── Tray Icon ────────────────────────────────────────────────────────────────
 
 /// Generates a 22×22 RGBA lightning-bolt icon (black on transparent).
@@ -854,9 +1290,9 @@ fn lightning_bolt_icon_rgba() -> Vec<u8> {
     let mut set = |x: u32, y: u32| {
         if x < W && y < H {
             let i = ((y * W + x) * 4) as usize;
-            rgba[i]     = 0;   // R — black
-            rgba[i + 1] = 0;   // G
-            rgba[i + 2] = 0;   // B
+            rgba[i] = 0; // R — black
+            rgba[i + 1] = 0; // G
+            rgba[i + 2] = 0; // B
             rgba[i + 3] = 255; // A — fully opaque
         }
     };
@@ -894,37 +1330,46 @@ fn main() {
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Regular);
 
-            let app_data_dir    = app.path().app_data_dir().expect("path failed");
-            let port_overrides  = load_port_overrides(&app_data_dir);
-            let env_overrides   = load_env_overrides(&app_data_dir);
-            let tailscale_host  = get_tailscale_host();
-            let projects        = scan_projects(Path::new(PROJECTS_DIR), &port_overrides);
-            let initial_menu    = build_tray_menu(app, &projects, &[], &tailscale_host);
+            let app_data_dir = app.path().app_data_dir().expect("path failed");
+            let port_overrides = load_port_overrides(&app_data_dir);
+            let env_overrides = load_env_overrides(&app_data_dir);
+            let tailscale_host = get_tailscale_host();
+            let projects = scan_projects(Path::new(PROJECTS_DIR), &port_overrides);
+            let initial_menu = build_tray_menu(app, &projects, &[], &tailscale_host);
 
             app.manage(ServerState {
-                processes:      Mutex::new(HashMap::new()),
-                start_times:    Mutex::new(HashMap::new()),
-                log_buffers:    Mutex::new(HashMap::new()),
-                latency_cache:  Mutex::new(HashMap::new()),
-                projects:       Mutex::new(projects),
+                processes: Mutex::new(HashMap::new()),
+                start_times: Mutex::new(HashMap::new()),
+                log_buffers: Mutex::new(HashMap::new()),
+                latency_cache: Mutex::new(HashMap::new()),
+                projects: Mutex::new(projects),
                 tailscale_host,
-                env_overrides:  Mutex::new(env_overrides),
+                env_overrides: Mutex::new(env_overrides),
             });
 
             let tray = TrayIconBuilder::new()
                 .menu(&initial_menu)
-                .icon(tauri::image::Image::new_owned(lightning_bolt_icon_rgba(), 22, 22))
-                .icon_as_template(true)   // macOS: renders white on dark bar, black on light bar
+                .icon(tauri::image::Image::new_owned(
+                    lightning_bolt_icon_rgba(),
+                    22,
+                    22,
+                ))
+                .icon_as_template(true) // macOS: renders white on dark bar, black on light bar
                 .on_menu_event(|app: &tauri::AppHandle, event: tauri::menu::MenuEvent| {
                     handle_menu_event(app, event.id().as_ref());
                 })
                 .on_tray_icon_event(
                     |tray: &tauri::tray::TrayIcon<tauri::Wry>, event: TrayIconEvent| {
                         tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
-                        if let TrayIconEvent::Click { button: MouseButton::Left, .. } = event {
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            ..
+                        } = event
+                        {
                             if let Some(win) = tray.app_handle().get_webview_window("main") {
                                 let _ = tauri_plugin_positioner::WindowExt::move_window(
-                                    &win, Position::TrayCenter,
+                                    &win,
+                                    Position::TrayCenter,
                                 );
                                 if win.is_visible().unwrap_or(false) {
                                     let _ = win.hide();
@@ -966,6 +1411,11 @@ fn main() {
             set_env_overrides,
             get_autostart_enabled,
             set_autostart_enabled,
+            get_window_ring_settings,
+            save_window_ring_settings,
+            apply_window_ring_settings,
+            get_hammerspoon_status,
+            launch_hammerspoon,
         ])
         .build(tauri::generate_context!())
         .expect("error building tauri")
@@ -973,7 +1423,9 @@ fn main() {
             if let tauri::RunEvent::Exit = event {
                 if let Some(state) = app.try_state::<ServerState>() {
                     let mut procs = state.processes.lock().unwrap();
-                    for (_, child) in procs.iter_mut() { let _ = child.kill(); }
+                    for (_, child) in procs.iter_mut() {
+                        let _ = child.kill();
+                    }
                 }
             }
         });

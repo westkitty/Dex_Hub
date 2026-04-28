@@ -1,7 +1,8 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import {
   Search, Grid3X3, List, StopCircle, RefreshCw,
   Wifi, WifiOff, Star, Zap, ChevronDown, ChevronUp, ExternalLink,
+  Keyboard, Layers3, CheckSquare, Square, Filter, X,
 } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import { ServerCard, type HealthStatus } from './ServerCard';
@@ -21,6 +22,7 @@ import {
   getServerUrl,
   scanExternalServers,
 } from '../lib/servers';
+import { playFeedback, useDebouncedValue, usePersistentState } from '../lib/ui';
 
 const POLL_MS          = 2000;
 const EXT_SCAN_MS      = 8000;
@@ -28,6 +30,9 @@ const UNDO_TIMEOUT_MS  = 5000;
 const SESSION_SEARCH_KEY = 'dexhub_search';
 const LS_COLLAPSED_KEY   = 'dexhub_collapsed_workspaces';
 const LS_FAV_ORDER_KEY   = 'dexhub_favorites_order';
+const LS_FILTER_KEY       = 'dexhub_server_filter';
+const PAGE_SIZE           = 24;
+const SEARCH_DEBOUNCE_MS  = import.meta.env.MODE === 'test' ? 0 : 180;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -48,22 +53,32 @@ function wsAccentColor(ws: string) {
 
 interface Props {
   onRunningCountChange?: (count: number) => void;
+  refreshSignal?: number;
 }
 
-export function ServersView({ onRunningCountChange }: Props) {
+export function ServersView({ onRunningCountChange, refreshSignal = 0 }: Props) {
   // ── Core state ──────────────────────────────────────────────────────────────
   const [projects,   setProjects]   = useState<ProjectConfig[]>([]);
   const [running,    setRunning]    = useState<Set<string>>(new Set());
   const [health,     setHealth]     = useState<Record<string, HealthStatus>>({});
   const [favorites,  setFavorites]  = useState<Set<string>>(new Set());
+  const [bootstrapping, setBootstrapping] = useState(true);
+  const [statusMessage, setStatusMessage] = useState('');
   const [favOrder,   setFavOrder]   = useState<string[]>([]);  // ordered favorites list
   const [search,     setSearch]     = useState<string>(() => {
     // UX #9 — search persists across view switches within a session
     try { return sessionStorage.getItem(SESSION_SEARCH_KEY) ?? ''; } catch { return ''; }
   });
+  const [filterMode, setFilterMode] = usePersistentState<'all' | 'running' | 'favorites'>(LS_FILTER_KEY, 'all');
   const [viewMode,   setViewMode]   = useState<'grid' | 'compact'>('grid');
   const [tailscale,  setTailscale]  = useState('');
   const [qrUrl,      setQrUrl]      = useState<string | null>(null);
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showKeymap, setShowKeymap] = useState(false);
+  const [workspaceVisibleCount, setWorkspaceVisibleCount] = useState<Record<string, number>>({});
+  const debouncedSearch = useDebouncedValue(search, SEARCH_DEBOUNCE_MS);
 
   // ── Workspace collapse (UX #8) ─────────────────────────────────────────────
   const [collapsed, setCollapsed] = useState<Set<string>>(() => {
@@ -88,12 +103,22 @@ export function ServersView({ onRunningCountChange }: Props) {
   const userStartedRef  = useRef<Set<string>>(new Set());
   const prevHealthRef   = useRef<Record<string, HealthStatus>>({});
   const visibleCardsRef = useRef<string[]>([]);   // kept fresh each render for keyboard nav
+  const selectedCount = selected.size;
 
   // ── Initial load ───────────────────────────────────────────────────────────
   useEffect(() => {
+    setBootstrapping(true);
     Promise.all([listProjects(), getFavoritesFromRust(), getTailscaleAddress()])
       .then(([ps, favs, ts]) => {
         setProjects(ps);
+        setWorkspaceVisibleCount(() => {
+          const map: Record<string, number> = {};
+          for (const p of ps) {
+            const ws = p.workspace || 'Root';
+            if (!map[ws]) map[ws] = PAGE_SIZE;
+          }
+          return map;
+        });
         setFavorites(new Set(favs));
         // Load favOrder from localStorage (or default to favorites list order)
         try {
@@ -104,11 +129,16 @@ export function ServersView({ onRunningCountChange }: Props) {
         } catch { setFavOrder(favs); }
         setTailscale(ts.trim());
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => setBootstrapping(false));
   }, []);
 
   // ── Running count passthrough ──────────────────────────────────────────────
   useEffect(() => { onRunningCountChange?.(running.size); }, [running.size, onRunningCountChange]);
+
+  useEffect(() => () => {
+    if (undoTimer.current) clearTimeout(undoTimer.current);
+  }, []);
 
   // ── Poll running servers + health ──────────────────────────────────────────
   useEffect(() => {
@@ -161,11 +191,32 @@ export function ServersView({ onRunningCountChange }: Props) {
     catch { /* ignore */ }
   }, [collapsed]);
 
+  // External refresh signal (command palette / app shell)
+  useEffect(() => {
+    if (refreshSignal <= 0) return;
+    handleRefresh();
+  }, [refreshSignal]);
+
   // ── Keyboard shortcuts ────────────────────────────────────────────────────
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       const meta = e.metaKey || e.ctrlKey;
+      if (e.key === '?' || (e.shiftKey && e.key === '/')) {
+        e.preventDefault();
+        setShowKeymap(v => !v);
+        return;
+      }
       if (meta && e.key === 'r') { e.preventDefault(); handleRefresh(); return; }
+      if (meta && e.key.toLowerCase() === 'f') {
+        e.preventDefault();
+        setShowAdvanced(v => !v);
+        return;
+      }
+      if (meta && e.key.toLowerCase() === 'a' && selectionMode) {
+        e.preventDefault();
+        setSelected(new Set(getAllVisibleCards()));
+        return;
+      }
       if (e.key === '/' && document.activeElement?.tagName !== 'INPUT') {
         e.preventDefault();
         document.querySelector<HTMLInputElement>('input[placeholder="Search servers…"]')?.focus();
@@ -193,12 +244,19 @@ export function ServersView({ onRunningCountChange }: Props) {
     }
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [focusedName, running]);
+  }, [focusedName, running, selectionMode]);
 
   // ── Actions ────────────────────────────────────────────────────────────────
   async function handleRefresh() {
-    try { setProjects(await refreshProjects()); } catch { /* ignore */ }
+    try {
+      const refreshed = await refreshProjects();
+      setProjects(refreshed);
+      setStatusMessage(`Refreshed ${refreshed.length} projects.`);
+      playFeedback('success');
+    } catch {
+      setStatusMessage('Refresh failed.');
+      playFeedback('error');
+    }
   }
 
   async function handleStopAll() {
@@ -207,11 +265,16 @@ export function ServersView({ onRunningCountChange }: Props) {
     try {
       await stopAllServers();
       setRunning(new Set());
+      setStatusMessage(`Stopped ${prevRunning.length} servers.`);
       // Undo toast
       setUndoPayload(prevRunning);
       if (undoTimer.current) clearTimeout(undoTimer.current);
       undoTimer.current = setTimeout(() => setUndoPayload(null), UNDO_TIMEOUT_MS);
-    } catch { /* ignore */ }
+      playFeedback('success');
+    } catch {
+      setStatusMessage('Stop-all failed.');
+      playFeedback('error');
+    }
   }
 
   async function handleUndoStopAll() {
@@ -225,17 +288,20 @@ export function ServersView({ onRunningCountChange }: Props) {
     userStartedRef.current.add(name);
     setRunning(prev => new Set([...prev, name]));
     setHealth(prev => ({ ...prev, [name]: 'starting' }));
+    setStatusMessage(`Starting ${name}.`);
     startServer(name).catch(() => {});
   }
 
   function handleStop(name: string) {
     setRunning(prev => { const n = new Set(prev); n.delete(name); return n; });
     setHealth(prev => ({ ...prev, [name]: 'down' }));
+    setStatusMessage(`Stopped ${name}.`);
     stopServer(name).catch(() => {});
   }
 
   function handleRestart(name: string) {
     setHealth(prev => ({ ...prev, [name]: 'starting' }));
+    setStatusMessage(`Restarting ${name}.`);
     restartServer(name).catch(() => {});
   }
 
@@ -250,6 +316,7 @@ export function ServersView({ onRunningCountChange }: Props) {
         setFavOrder(o => [...o, name]);
       }
       saveFavoritesToRust(Array.from(next)).catch(() => {});
+      setStatusMessage(next.has(name) ? `${name} added to favorites.` : `${name} removed from favorites.`);
       return next;
     });
   }
@@ -264,6 +331,43 @@ export function ServersView({ onRunningCountChange }: Props) {
       if (next.has(ws)) next.delete(ws); else next.add(ws);
       return next;
     });
+  }
+
+  useEffect(() => {
+    if (!selectionMode) {
+      setSelected(new Set());
+    }
+  }, [selectionMode]);
+
+  function toggleSelected(name: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
+  }
+
+  function clearSelection() {
+    setSelected(new Set());
+  }
+
+  function bulkStart() {
+    for (const name of Array.from(selected)) handleStart(name);
+    setStatusMessage(`Bulk start requested for ${selected.size} server(s).`);
+    clearSelection();
+  }
+
+  function bulkStop() {
+    for (const name of Array.from(selected)) handleStop(name);
+    setStatusMessage(`Bulk stop requested for ${selected.size} server(s).`);
+    clearSelection();
+  }
+
+  function bulkToggleFavorite() {
+    for (const name of Array.from(selected)) handleToggleFavorite(name);
+    setStatusMessage(`Updated favorites for ${selected.size} server(s).`);
+    clearSelection();
   }
 
   // ── Drag-to-reorder favorites (UX #4) ─────────────────────────────────────
@@ -294,9 +398,13 @@ export function ServersView({ onRunningCountChange }: Props) {
   const allPorts = projects.map(p => p.port);
 
   // ── Derived data ───────────────────────────────────────────────────────────
-  const filtered = projects.filter(p =>
-    p.name.toLowerCase().includes(search.toLowerCase()),
-  );
+  const filtered = useMemo(() => projects.filter((p) => {
+    const matchesName = p.name.toLowerCase().includes(debouncedSearch.toLowerCase());
+    if (!matchesName) return false;
+    if (filterMode === 'running' && !running.has(p.name)) return false;
+    if (filterMode === 'favorites' && !favorites.has(p.name)) return false;
+    return true;
+  }), [projects, debouncedSearch, filterMode, running, favorites]);
 
   // Keep visible cards ref fresh for keyboard nav (must be AFTER filtered)
   visibleCardsRef.current = filtered.map(p => p.name);
@@ -338,6 +446,11 @@ export function ServersView({ onRunningCountChange }: Props) {
     }),
   ] as [string, ProjectConfig[]]);
 
+  const pagedWorkspaceEntries = sortedWorkspaceEntries.map(([ws, ps]) => {
+    const limit = workspaceVisibleCount[ws] ?? PAGE_SIZE;
+    return [ws, ps.slice(0, limit), ps.length > limit] as [string, ProjectConfig[], boolean];
+  });
+
   const isTailscale = tailscale !== '' && tailscale !== 'localhost';
   const gridClass   = viewMode === 'compact' ? 'grid-cols-1' : 'grid-cols-2';
 
@@ -351,9 +464,25 @@ export function ServersView({ onRunningCountChange }: Props) {
     return (
       <div
         key={p.name}
-        className={focusedName === p.name ? 'keyboard-focus' : ''}
+        className={`relative ${focusedName === p.name ? 'keyboard-focus' : ''}`}
         {...dragProps}
       >
+        {selectionMode && (
+          <label className="absolute top-2 left-2 z-20 inline-flex items-center justify-center w-6 h-6 rounded-md border border-white/20 bg-black/40 backdrop-blur-sm cursor-pointer">
+            <input
+              type="checkbox"
+              className="sr-only"
+              checked={selected.has(p.name)}
+              onChange={() => toggleSelected(p.name)}
+              aria-label={`Select ${p.name}`}
+            />
+            {selected.has(p.name) ? (
+              <CheckSquare className="w-3.5 h-3.5 text-accent-primary" />
+            ) : (
+              <Square className="w-3.5 h-3.5 text-gray-400" />
+            )}
+          </label>
+        )}
         <ServerCard
           project={p}
           running={running.has(p.name)}
@@ -403,6 +532,20 @@ export function ServersView({ onRunningCountChange }: Props) {
         >
           {viewMode === 'grid' ? <List className="w-4 h-4" /> : <Grid3X3 className="w-4 h-4" />}
         </button>
+        <button
+          onClick={() => setSelectionMode((v) => !v)}
+          className={`icon-btn ${selectionMode ? 'text-accent-primary' : ''}`}
+          title={selectionMode ? 'Exit select mode' : 'Select multiple servers'}
+        >
+          <Layers3 className="w-4 h-4" />
+        </button>
+        <button
+          onClick={() => setShowAdvanced(v => !v)}
+          className={`icon-btn ${showAdvanced ? 'text-accent-primary' : ''}`}
+          title="Advanced filters (⌘F)"
+        >
+          <Filter className="w-4 h-4" />
+        </button>
         {/* UI #7 — Stop All with destructive glow when servers running */}
         <button
           onClick={handleStopAll}
@@ -418,7 +561,70 @@ export function ServersView({ onRunningCountChange }: Props) {
         <button onClick={handleRefresh} className="icon-btn" title="Refresh projects (⌘R)">
           <RefreshCw className="w-4 h-4" />
         </button>
+        <button
+          onClick={() => setShowKeymap(true)}
+          className="icon-btn"
+          title="Keyboard shortcuts"
+        >
+          <Keyboard className="w-4 h-4" />
+        </button>
       </div>
+
+      {showAdvanced && (
+        <div className="px-3 py-2 border-b border-white/5 bg-black/10 flex items-center gap-2 text-[11px] text-gray-400">
+          <span>Filter:</span>
+          {(['all', 'running', 'favorites'] as const).map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              onClick={() => setFilterMode(mode)}
+              className={`px-2 py-1 rounded border transition-colors ${
+                filterMode === mode
+                  ? 'border-accent-primary/40 bg-accent-primary/15 text-accent-primary'
+                  : 'border-white/10 hover:border-white/20 hover:bg-white/5'
+              }`}
+            >
+              {mode}
+            </button>
+          ))}
+          {selectionMode && (
+            <span className="ml-auto text-[10px] text-gray-500">⌘A selects visible servers</span>
+          )}
+        </div>
+      )}
+
+      {selectionMode && (
+        <div className="px-3 py-2 border-b border-white/5 bg-black/10 flex items-center gap-2 text-xs">
+          <span className="text-gray-400 min-w-24">{selectedCount} selected</span>
+          <button
+            type="button"
+            onClick={bulkStart}
+            disabled={selectedCount === 0}
+            className="btn-action disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Bulk Start
+          </button>
+          <button
+            type="button"
+            onClick={bulkStop}
+            disabled={selectedCount === 0}
+            className="btn-action disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Bulk Stop
+          </button>
+          <button
+            type="button"
+            onClick={bulkToggleFavorite}
+            disabled={selectedCount === 0}
+            className="btn-action disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            Bulk Favorite
+          </button>
+          <button type="button" onClick={clearSelection} className="icon-btn w-6 h-6 ml-auto" title="Clear selected">
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
 
       {/* ── Tailscale pill (UI #10) ── */}
       <div className="flex items-center gap-2 px-3 py-1.5 border-b border-white/5 bg-black/10 flex-shrink-0 relative z-10">
@@ -429,7 +635,7 @@ export function ServersView({ onRunningCountChange }: Props) {
           }
         </div>
         {running.size > 0 && (
-          <span className="ml-auto text-[10px] font-medium text-green-400/70">
+          <span className="ml-auto text-[10px] font-medium text-green-400/70 tabular-nums">
             {running.size} running
           </span>
         )}
@@ -449,10 +655,16 @@ export function ServersView({ onRunningCountChange }: Props) {
       )}
 
       {/* ── Project list ── */}
-      <div className="flex-1 overflow-y-auto p-3 space-y-4 custom-scrollbar relative z-10">
+      <div className="flex-1 overflow-y-auto p-3 space-y-4 custom-scrollbar relative z-10 snap-y snap-proximity">
 
-        {/* UI #8 — Empty state with guidance */}
-        {filtered.length === 0 ? (
+        {bootstrapping ? (
+          <div className={`grid ${gridClass} gap-2`}>
+            {Array.from({ length: 6 }).map((_, idx) => (
+              <div key={idx} className="glass-card h-24 animate-pulse border border-white/8 bg-white/5" />
+            ))}
+          </div>
+        ) : filtered.length === 0 ? (
+          /* UI #8 — Empty state with guidance */
           <div className="flex flex-col items-center justify-center mt-12 gap-3">
             <div className="w-12 h-12 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-center">
               <Zap className="w-6 h-6 text-gray-600" />
@@ -464,12 +676,21 @@ export function ServersView({ onRunningCountChange }: Props) {
               <p className="text-xs text-gray-700 max-w-[200px] leading-relaxed">
                 {search
                   ? 'Try a different search term'
-                  : 'DexHub looks for package.json with a dev script in ~/Projects'}
+                  : 'DexHub looks for package.json launch targets in ~/Projects'}
               </p>
             </div>
             {!search && (
               <button onClick={handleRefresh} className="btn-action text-gray-400 mt-1">
                 <RefreshCw className="w-3 h-3" />Refresh
+              </button>
+            )}
+            {filterMode !== 'all' && (
+              <button
+                type="button"
+                onClick={() => setFilterMode('all')}
+                className="btn-action text-gray-300 mt-1"
+              >
+                Clear filters
               </button>
             )}
           </div>
@@ -499,11 +720,12 @@ export function ServersView({ onRunningCountChange }: Props) {
             )}
 
             {/* ── Workspace sections ── */}
-            {sortedWorkspaceEntries.map(([ws, wsProjects]) => {
+            {pagedWorkspaceEntries.map(([ws, wsProjects, hasMore]) => {
               const accent = wsAccentColor(ws);
               const isCollapsed = collapsed.has(ws);
+              const totalCount = workspaceMap.get(ws)?.length ?? wsProjects.length;
               return (
-                <section key={ws}>
+                <section key={ws} className="snap-start">
                   {/* UI #3 — workspace header with accent color */}
                   <button
                     onClick={() => toggleCollapsed(ws)}
@@ -519,10 +741,10 @@ export function ServersView({ onRunningCountChange }: Props) {
                     >
                       {ws}
                     </span>
-                    <span className="text-[10px] text-gray-700">{wsProjects.length}</span>
+                    <span className="text-[10px] text-gray-700 tabular-nums">{totalCount}</span>
                     {/* Running count in section */}
                     {wsProjects.filter(p => running.has(p.name)).length > 0 && (
-                      <span className="text-[9px] text-green-400/60 ml-0.5">
+                      <span className="text-[9px] text-green-400/60 ml-0.5 tabular-nums">
                         ●{wsProjects.filter(p => running.has(p.name)).length}
                       </span>
                     )}
@@ -533,9 +755,23 @@ export function ServersView({ onRunningCountChange }: Props) {
                     </span>
                   </button>
                   {!isCollapsed && (
-                    <div className={`grid ${gridClass} gap-2 animate-cards`}>
-                      {wsProjects.map(p => renderCard(p))}
-                    </div>
+                    <>
+                      <div className={`grid ${gridClass} gap-2 animate-cards`}>
+                        {wsProjects.map(p => renderCard(p))}
+                      </div>
+                      {hasMore && (
+                        <button
+                          type="button"
+                          onClick={() => setWorkspaceVisibleCount((prev) => ({
+                            ...prev,
+                            [ws]: (prev[ws] ?? PAGE_SIZE) + PAGE_SIZE,
+                          }))}
+                          className="btn-action text-gray-300 mt-2"
+                        >
+                          Show more in {ws}
+                        </button>
+                      )}
+                    </>
                   )}
                 </section>
               );
@@ -595,7 +831,35 @@ export function ServersView({ onRunningCountChange }: Props) {
           </div>
         </div>
       )}
+
+      {showKeymap && (
+        <div
+          className="absolute inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50"
+          onClick={() => setShowKeymap(false)}
+          role="dialog"
+          aria-modal="true"
+          aria-label="Keyboard shortcuts"
+        >
+          <div className="glass-card w-[min(420px,90vw)] p-4 space-y-3" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-white/85">Keyboard Shortcuts</h3>
+              <button className="icon-btn w-6 h-6" onClick={() => setShowKeymap(false)} title="Close">
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+            <ul className="text-xs text-gray-400 space-y-1.5">
+              <li><kbd className="kbd">⌘/Ctrl + R</kbd> Refresh projects</li>
+              <li><kbd className="kbd">/</kbd> Focus search</li>
+              <li><kbd className="kbd">?</kbd> Toggle this shortcut panel</li>
+              <li><kbd className="kbd">⌘/Ctrl + F</kbd> Toggle advanced filters</li>
+              <li><kbd className="kbd">↑ ↓ Enter Esc</kbd> Navigate and control focused card</li>
+              <li><kbd className="kbd">⌘/Ctrl + A</kbd> Select all visible cards (selection mode)</li>
+            </ul>
+          </div>
+        </div>
+      )}
+
+      <div className="sr-only" aria-live="polite">{statusMessage}</div>
     </div>
   );
 }
-

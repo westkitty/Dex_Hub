@@ -51,9 +51,9 @@ describe('Sidebar', () => {
     expect(onViewChange).toHaveBeenCalledWith('kanban');
   });
 
-  it('does not call onViewChange when disabled Settings item is clicked', () => {
+  it('calls onViewChange with "settings" when Settings is clicked', () => {
     render(<Sidebar activeView="servers" onViewChange={onViewChange} />);
     fireEvent.click(screen.getByText('Settings'));
-    expect(onViewChange).not.toHaveBeenCalled();
+    expect(onViewChange).toHaveBeenCalledWith('settings');
   });
 });

@@ -26,11 +26,11 @@ export function Sidebar({ activeView, onViewChange, runningCount = 0 }: Props) {
   const navItems: Array<{
     icon:  React.ComponentType<{ className?: string }>;
     label: string;
-    view:  View | null;
+    view:  View;
   }> = [
     { icon: Server,     label: "Dev Servers", view: "servers" },
     { icon: LayoutGrid, label: "Omni-View",   view: "kanban"  },
-    { icon: Settings,   label: "Settings",    view: null       },
+    { icon: Settings,   label: "Settings",    view: "settings" },
   ];
 
   async function togglePin() {
@@ -77,17 +77,14 @@ export function Sidebar({ activeView, onViewChange, runningCount = 0 }: Props) {
           return (
             <button
               key={item.label}
-              onClick={() => item.view && onViewChange(item.view)}
-              disabled={!item.view}
+              onClick={() => onViewChange(item.view)}
               className={clsx(
                 "nav-item w-full flex items-center gap-2.5 px-3 py-2 rounded-lg",
                 "text-sm font-medium transition-all duration-150",
                 isActive && "active",
                 isActive
                   ? "bg-accent-primary/10 text-accent-primary"
-                  : item.view
-                  ? "text-gray-400 hover:bg-white/[0.06] hover:text-white active:scale-[0.97] active:bg-white/[0.04] active:transition-none"
-                  : "text-gray-600 cursor-not-allowed opacity-40",
+                  : "text-gray-400 hover:bg-white/[0.06] hover:text-white active:scale-[0.97] active:bg-white/[0.04] active:transition-none",
               )}
             >
               <item.icon className="w-4 h-4 flex-shrink-0" />

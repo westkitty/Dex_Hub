@@ -1,0 +1,11 @@
+.git/
+DerivedData/
+build/
+*.xcodeproj/
+*.xcworkspace/
+Pods/
+.build/
+node_modules/
+__pycache__/
+.vscode/
+.antigravity/
